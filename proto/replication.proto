@@ -1,0 +1,80 @@
+syntax = "proto3";
+import "google/protobuf/empty.proto";
+
+message NodeAddress {
+    string host = 1;
+    int32  port = 2;
+}
+
+message KeyRange {
+    uint32               start = 1;
+    uint32               end   = 2;
+    optional NodeAddress owner = 3;
+}
+
+message NodeConfig {
+    int32           node_id     = 1;
+    NodeAddress     self_addr   = 2;
+    ReplicationMode mode        = 3;
+    KeyRange        head_range  = 4;
+    KeyRange        tail_range  = 5;
+
+    optional NodeAddress prev   = 6;  // absent = no predecessor (head)
+    optional NodeAddress next   = 7;  // absent = no successor (tail)
+    repeated KeyRange    ranges = 8;
+    optional NodeAddress tail   = 9;  // might not be required
+}
+
+enum ReplicationMode {
+    CHAIN = 0;
+    CRAQ  = 1;
+    CROWN = 2;
+}
+
+message PutRequest {
+    uint64 request_id = 1;
+    string key = 2;
+    string value = 3;
+    string source_ip = 4;
+    uint64 version = 5;
+}
+
+message PutResponse {
+    bool   success = 1;
+    uint64 version = 2;
+}
+
+message GetRequest {
+    string key = 1;
+}
+
+message GetResponse {
+    string key     = 1;
+    string value   = 2;
+    uint64 version = 3;
+}
+
+message VersionQueryRequest {
+    string key = 1;
+}
+
+message VersionQueryResponse {
+    string key             = 1;
+    uint64 latest_version  = 2; // latest committed (clean) version at the tail
+}
+
+message AckRequest {
+    string key     = 1;
+    uint64 version = 2;
+    string client_addr = 3; // client identity/address for async commit correlation
+    uint64 request_id  = 4; // request correlation id from original write
+}
+
+service ReplicationService {
+    rpc Configure    (NodeConfig)        returns (google.protobuf.Empty);
+    rpc Put          (PutRequest)        returns (PutResponse);
+    rpc Get          (GetRequest)        returns (GetResponse);
+    rpc Ack          (AckRequest)        returns (google.protobuf.Empty);
+    // CRAQ and CROWN
+    rpc VersionQuery (VersionQueryRequest) returns (VersionQueryResponse);
+}

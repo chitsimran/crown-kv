@@ -1,5 +1,6 @@
 # Prerequisites
 *.d
+*.env
 
 # Compiled Object files
 *.slo
@@ -39,3 +40,24 @@
 
 # debug information files
 *.dwo
+
+# Build directory
+build/
+
+# Compile commands (symlinked from build/)
+compile_commands.json
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# cache
+.cache/
+
+*.pyc
+*.pyd
