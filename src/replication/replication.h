@@ -1,18 +1,32 @@
-#include <iostream>
-#include <mutex>
-
 #include "../proto/replication.pb.h"
 #include "proto/replication.grpc.pb.h"
 #include "../kv_store/kv_store.h"
+#include <unordered_map>
 
 class Replication {
-private:
-    KVStore kv_store;
-    std::unordered_map<char, std::unique_ptr<ReplicationService::Stub>> key_mapping;
 public:
-    void handle_put(PutRequest request) {};
+    KVStore kv_store;
+    
+    // passed on by server in constructor // key -> head node
+    std::unordered_map<char, std::unique_ptr<ReplicationService::Stub>> key_mapping;
 
-    void handle_get(std::string key) {};
+    // passed on by server in constructor // key -> tail node
+    std::unordered_map<char, std::unique_ptr<ReplicationService::Stub>> key_tail_mapping;
 
-    void handle_ack(int64_t request_id) {};
+    std::unordered_map<int64_t, PutRequest> pending_acks; // request_id -> request
+
+    void add_to_pending_acks(PutRequest request) {};
+
+    // asynchronously forward the put request to the next node, and add it to pending_acks until you receive an ack for it
+    void forward_put(PutRequest request, std::unique_ptr<ReplicationService::Stub>& next_stub) {};
+
+    // if prev_stub is null, send ack to the client (source_ip in the request), else send ack to the prev node
+    void send_ack(int64_t request_id, std::optional<std::unique_ptr<ReplicationService::Stub>>& prev_stub) {};
+
+    virtual void handle_put(PutRequest request) = 0;
+
+    // in case of craq and crown check with Tail the latest version if you have a dirty version
+    virtual GetResponse handle_get(std::string key) = 0;
+
+    virtual void handle_ack(int64_t request_id) = 0;
 };

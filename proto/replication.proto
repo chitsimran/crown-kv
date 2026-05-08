@@ -7,8 +7,8 @@ message NodeAddress {
 }
 
 message KeyRange {
-    uint32               start = 1;
-    uint32               end   = 2;
+    uint64               start = 1;
+    uint64               end   = 2;
     optional NodeAddress owner = 3;
 }
 
@@ -16,7 +16,7 @@ message NodeConfig {
     int32           node_id     = 1;
     NodeAddress     self_addr   = 2;
     ReplicationMode mode        = 3;
-    KeyRange        head_range  = 4;
+    KeyRange        head_range  = 4; // 0-0
     KeyRange        tail_range  = 5;
 
     optional NodeAddress prev   = 6;  // absent = no predecessor (head)
@@ -36,7 +36,7 @@ message PutRequest {
     string key = 2;
     string value = 3;
     string source_ip = 4;
-    uint64 version = 5;
+    uint64 version = 5; // if version is 0, it means the request is from client to head, else its from server to server
 }
 
 message PutResponse {
@@ -70,11 +70,16 @@ message AckRequest {
     uint64 request_id  = 4; // request correlation id from original write
 }
 
+message InflightRequest {
+    uint64 node_id = 1;
+}
+
 service ReplicationService {
     rpc Configure    (NodeConfig)        returns (google.protobuf.Empty);
     rpc Put          (PutRequest)        returns (PutResponse);
     rpc Get          (GetRequest)        returns (GetResponse);
     rpc Ack          (AckRequest)        returns (google.protobuf.Empty);
+    rpc Inflight     (InflightRequest)   returns (google.protobuf.Empty);
     // CRAQ and CROWN
     rpc VersionQuery (VersionQueryRequest) returns (VersionQueryResponse);
 }
