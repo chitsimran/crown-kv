@@ -17,7 +17,17 @@ run_as_root() {
     return 1
 }
 
-ensure_passwordless_sudo() {
+have_required_tools() {
+    local missing=0
+    for tool in git cmake make g++ tmux pkg-config protoc grpc_cpp_plugin; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing=1
+        fi
+    done
+    return "$missing"
+}
+
+ensure_sudo() {
     if [[ "$(id -u)" -eq 0 ]]; then
         return
     fi
@@ -25,22 +35,33 @@ ensure_passwordless_sudo() {
         echo "ERROR: sudo is not installed. Run as root or install sudo first."
         exit 1
     fi
-    if ! sudo -n true 2>/dev/null; then
-        echo "ERROR: sudo requires a password for $DEPLOY_USER."
-        echo "Configure passwordless sudo, or run this script as root."
-        exit 1
+    if sudo -n true 2>/dev/null; then
+        return
     fi
+    if [[ -t 0 ]]; then
+        echo "sudo needs your VM password to install missing packages."
+        sudo -v
+        return
+    fi
+    echo "ERROR: sudo requires a password for $DEPLOY_USER, but no interactive terminal is available."
+    echo "Run this script with an SSH TTY, install packages manually, or configure passwordless sudo."
+    exit 1
 }
+
+if have_required_tools; then
+    echo "Required build tools already appear to be installed; skipping package install."
+    exit 0
+fi
 
 echo "Installing system packages..."
 if command -v apt-get >/dev/null 2>&1; then
-    ensure_passwordless_sudo
+    ensure_sudo
     run_as_root apt-get update -y
     run_as_root apt-get install -y \
         git cmake make g++ rsync openssh-client wget vim tmux pkg-config \
         libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
 elif command -v dnf >/dev/null 2>&1; then
-    ensure_passwordless_sudo
+    ensure_sudo
     run_as_root dnf install -y \
         git cmake make gcc-c++ rsync openssh-clients wget vim tmux pkgconf-pkg-config \
         grpc-devel protobuf-devel protobuf-compiler
