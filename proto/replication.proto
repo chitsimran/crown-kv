@@ -151,6 +151,16 @@ message MembershipResponse {
     string mode = 3;
 }
 
+message SetModeRequest {
+    string mode = 1;
+}
+
+message SetModeResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 epoch = 3;
+}
+
 service ReplicationService {
     rpc Put (PutRequest) returns (PutResponse);
     rpc Get (GetRequest) returns (GetResponse);
@@ -168,6 +178,7 @@ service ClientAckService {
 
 service MetadataService {
     rpc GetMembership (MembershipRequest) returns (MembershipResponse);
+    rpc SetMode (SetModeRequest) returns (SetModeResponse);
     rpc Freeze (FreezeRequest) returns (FreezeResponse);
     rpc Reconfigure (ReconfigureRequest) returns (ReconfigureResponse);
     rpc ReportDrainAck (DrainAckRequest) returns (DrainAckResponse);

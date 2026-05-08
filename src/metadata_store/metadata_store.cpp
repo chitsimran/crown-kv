@@ -27,6 +27,8 @@ using replication::ReconfigureRequest;
 using replication::ReconfigureResponse;
 using replication::ReportFailureRequest;
 using replication::ReportFailureResponse;
+using replication::SetModeRequest;
+using replication::SetModeResponse;
 using replication::SyncCompleteRequest;
 using replication::SyncCompleteResponse;
 
@@ -51,6 +53,7 @@ struct ClusterState {
 
 void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_node_id);
 void TriggerReconfigureAdd(ClusterState* state, const NodeInfo& added_node);
+void TriggerModeChange(ClusterState* state, const std::string& mode);
 
 bool ParseHostPort(const std::string& text, std::string* host, int* port) {
     auto pos = text.rfind(':');
@@ -111,6 +114,33 @@ public:
         response->set_mode(state_->mode);
         for (const auto& member : state_->membership) {
             *response->add_membership() = member;
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status SetMode(grpc::ServerContext*, const SetModeRequest* request,
+                         SetModeResponse* response) override {
+        const std::string mode = request->mode();
+        if (mode != "CHAIN" && mode != "CRAQ" && mode != "CROWN") {
+            response->set_success(false);
+            response->set_error("UNKNOWN_MODE");
+            return grpc::Status::OK;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (state_->mode == mode) {
+                response->set_success(true);
+                response->set_epoch(state_->epoch);
+                return grpc::Status::OK;
+            }
+        }
+
+        std::thread(TriggerModeChange, state_, mode).detach();
+        response->set_success(true);
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            response->set_epoch(state_->epoch + 1);
         }
         return grpc::Status::OK;
     }
@@ -321,6 +351,27 @@ void TriggerReconfigureAdd(ClusterState* state, const NodeInfo& added_node) {
     for (const auto& node : new_membership) {
         SendReconfigure(node, old_epoch + 1, new_membership, mode, "",
                         added_node.node_id());
+    }
+}
+
+void TriggerModeChange(ClusterState* state, const std::string& mode) {
+    std::vector<NodeInfo> membership;
+    uint64_t new_epoch = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->reconfig_in_progress.exchange(true)) {
+            return;
+        }
+        state->epoch += 1;
+        state->mode = mode;
+        new_epoch = state->epoch;
+        membership = state->membership;
+        state->reconfig_in_progress.store(false);
+    }
+
+    for (const auto& node : membership) {
+        SendReconfigure(node, new_epoch, membership, mode, "");
     }
 }
 
