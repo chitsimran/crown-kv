@@ -1,5 +1,6 @@
 #include "replication.grpc.pb.h"
 #include "replication/chain/chain_replication.h"
+#include "replication/craq/craq_replication.h"
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
@@ -27,6 +28,8 @@ using replication::PutResponse;
 using replication::ReconfigureRequest;
 using replication::ReconfigureResponse;
 using replication::ReplicationService;
+using replication::VersionQueryRequest;
+using replication::VersionQueryResponse;
 using replication::WriteAck;
 using replication::WriteAckResponse;
 
@@ -95,8 +98,12 @@ private:
 class NodeMetadataService final : public MetadataService::Service {
 public:
     NodeMetadataService(ServerState* state, MetadataClient* metadata_client,
-                        ChainReplication* replication)
-        : state_(state), metadata_client_(metadata_client), replication_(replication) {}
+                                                ChainReplication* chain_replication,
+                                                CraqReplication* craq_replication)
+                : state_(state),
+                    metadata_client_(metadata_client),
+                    chain_replication_(chain_replication),
+                    craq_replication_(craq_replication) {}
 
     grpc::Status Freeze(grpc::ServerContext*, const FreezeRequest* request,
                         FreezeResponse* response) override {
@@ -131,7 +138,9 @@ public:
             membership_copy = state_->membership;
             node_id = state_->node_id;
         }
-        replication_->update_membership(membership_copy, node_id);
+        chain_replication_->update_membership(membership_copy, node_id);
+        craq_replication_->update_membership(membership_copy, node_id);
+        craq_replication_->set_epoch(request->epoch());
         response->set_success(true);
         response->set_node_id(state_->node_id);
         return grpc::Status::OK;
@@ -140,13 +149,17 @@ public:
 private:
     ServerState* state_;
     MetadataClient* metadata_client_;
-    ChainReplication* replication_;
+    ChainReplication* chain_replication_;
+    CraqReplication* craq_replication_;
 };
 
-class ChainReplicationService final : public ReplicationService::Service {
+class ReplicationGatewayService final : public ReplicationService::Service {
 public:
-    ChainReplicationService(ServerState* state, ChainReplication* replication)
-        : state_(state), replication_(replication) {}
+    ReplicationGatewayService(ServerState* state, ChainReplication* chain_replication,
+                              CraqReplication* craq_replication)
+        : state_(state),
+          chain_replication_(chain_replication),
+          craq_replication_(craq_replication) {}
 
     grpc::Status Put(grpc::ServerContext*, const PutRequest* request,
                      PutResponse* response) override {
@@ -162,7 +175,8 @@ public:
             local_epoch = state_->epoch;
             mode = state_->mode;
         }
-        if (!mode.empty() && mode != "CHAIN") {
+        Replication* replication = SelectReplication(mode);
+        if (!replication) {
             response->set_success(false);
             response->set_error("WRONG_MODE");
             return grpc::Status::OK;
@@ -172,7 +186,7 @@ public:
             response->set_error("STALE_EPOCH");
             return grpc::Status::OK;
         }
-        *response = replication_->handle_put(*request);
+        *response = replication->handle_put(*request);
         return grpc::Status::OK;
     }
 
@@ -185,7 +199,8 @@ public:
             local_epoch = state_->epoch;
             mode = state_->mode;
         }
-        if (!mode.empty() && mode != "CHAIN") {
+        Replication* replication = SelectReplication(mode);
+        if (!replication) {
             response->set_success(false);
             response->set_error("WRONG_MODE");
             return grpc::Status::OK;
@@ -195,7 +210,7 @@ public:
             response->set_error("STALE_EPOCH");
             return grpc::Status::OK;
         }
-        *response = replication_->handle_put(*request);
+        *response = replication->handle_put(*request);
         return grpc::Status::OK;
     }
 
@@ -208,7 +223,8 @@ public:
             local_epoch = state_->epoch;
             mode = state_->mode;
         }
-        if (!mode.empty() && mode != "CHAIN") {
+        Replication* replication = SelectReplication(mode);
+        if (!replication) {
             response->set_error("WRONG_MODE");
             return grpc::Status::OK;
         }
@@ -216,7 +232,7 @@ public:
             response->set_error("STALE_EPOCH");
             return grpc::Status::OK;
         }
-        *response = replication_->handle_get(request->key());
+        *response = replication->handle_get(request->key());
         return grpc::Status::OK;
     }
 
@@ -229,7 +245,8 @@ public:
             local_epoch = state_->epoch;
             mode = state_->mode;
         }
-        if (!mode.empty() && mode != "CHAIN") {
+        Replication* replication = SelectReplication(mode);
+        if (!replication) {
             response->set_success(false);
             return grpc::Status::OK;
         }
@@ -237,18 +254,51 @@ public:
             response->set_success(false);
             return grpc::Status::OK;
         }
-        replication_->handle_ack(request->request_id());
+        replication->handle_ack(request->request_id());
         response->set_success(true);
         return grpc::Status::OK;
     }
 
+    grpc::Status VersionQuery(grpc::ServerContext*, const VersionQueryRequest* request,
+                              VersionQueryResponse* response) override {
+        uint64_t local_epoch = 0;
+        std::string mode;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            local_epoch = state_->epoch;
+            mode = state_->mode;
+        }
+        if (request->epoch() < local_epoch) {
+            response->set_error("STALE_EPOCH");
+            return grpc::Status::OK;
+        }
+        if (mode != "CRAQ") {
+            response->set_error("WRONG_MODE");
+            return grpc::Status::OK;
+        }
+        *response = craq_replication_->handle_version_query(*request);
+        return grpc::Status::OK;
+    }
+
 private:
+    Replication* SelectReplication(const std::string& mode) const {
+        if (mode == "CHAIN") {
+            return chain_replication_;
+        }
+        if (mode == "CRAQ") {
+            return craq_replication_;
+        }
+        return nullptr;
+    }
+
     ServerState* state_;
-    ChainReplication* replication_;
+    ChainReplication* chain_replication_;
+    CraqReplication* craq_replication_;
 };
 
 void RefreshMembership(ServerState* state, MetadataClient* client,
-                       ChainReplication* replication) {
+                       ChainReplication* chain_replication,
+                       CraqReplication* craq_replication) {
     MembershipResponse response;
     if (!client->GetMembership(&response)) {
         return;
@@ -266,10 +316,13 @@ void RefreshMembership(ServerState* state, MetadataClient* client,
         membership_copy = state->membership;
         node_id = state->node_id;
     }
-    replication->update_membership(membership_copy, node_id);
+    chain_replication->update_membership(membership_copy, node_id);
+    craq_replication->update_membership(membership_copy, node_id);
+    craq_replication->set_epoch(response.epoch());
 }
 
-void HeartbeatLoop(ServerState* state, MetadataClient* client, ChainReplication* replication,
+void HeartbeatLoop(ServerState* state, MetadataClient* client,
+                   ChainReplication* chain_replication, CraqReplication* craq_replication,
                    std::atomic<bool>* shutdown_flag) {
     while (!shutdown_flag->load()) {
         uint64_t master_epoch = 0;
@@ -280,7 +333,7 @@ void HeartbeatLoop(ServerState* state, MetadataClient* client, ChainReplication*
         }
         if (client->SendHeartbeat(state->node_id, local_epoch, &master_epoch)) {
             if (master_epoch > local_epoch) {
-                RefreshMembership(state, client, replication);
+                RefreshMembership(state, client, chain_replication, craq_replication);
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(kHeartbeatIntervalMs));
@@ -313,13 +366,16 @@ int main(int argc, char** argv) {
     ServerState state;
     state.node_id = node_id;
 
-    ChainReplication replication;
+    ChainReplication chain_replication;
+    CraqReplication craq_replication;
 
     MetadataClient metadata_client(metadata_addr);
-    RefreshMembership(&state, &metadata_client, &replication);
+    RefreshMembership(&state, &metadata_client, &chain_replication, &craq_replication);
 
-    NodeMetadataService metadata_service(&state, &metadata_client, &replication);
-    ChainReplicationService replication_service(&state, &replication);
+    NodeMetadataService metadata_service(&state, &metadata_client, &chain_replication,
+                                         &craq_replication);
+    ReplicationGatewayService replication_service(&state, &chain_replication,
+                                                  &craq_replication);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&metadata_service);
@@ -331,8 +387,8 @@ int main(int argc, char** argv) {
     }
 
     std::atomic<bool> shutdown_flag{false};
-    std::thread heartbeat_thread(HeartbeatLoop, &state, &metadata_client, &replication,
-                                 &shutdown_flag);
+    std::thread heartbeat_thread(HeartbeatLoop, &state, &metadata_client, &chain_replication,
+                                 &craq_replication, &shutdown_flag);
 
     std::cout << "Server listening on " << listen_addr << std::endl;
     server->Wait();
