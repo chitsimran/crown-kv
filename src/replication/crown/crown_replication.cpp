@@ -1,4 +1,4 @@
-#include "craq_replication.h"
+#include "crown_replication.h"
 
 #include <grpcpp/grpcpp.h>
 
@@ -20,7 +20,7 @@ std::shared_ptr<ReplicationService::Stub> BuildStub(
 
 } // namespace
 
-CraqReplication::CleanState CraqReplication::get_committed_state(
+CrownReplication::CleanState CrownReplication::get_committed_state(
     const std::string& key) {
     CleanState state;
     std::lock_guard<std::mutex> lock(KVStore::mutex_store_);
@@ -32,14 +32,14 @@ CraqReplication::CleanState CraqReplication::get_committed_state(
     return state;
 }
 
-bool CraqReplication::has_dirty(const std::string& key) {
+bool CrownReplication::has_dirty(const std::string& key) {
     std::lock_guard<std::mutex> lock(KVStore::mutex_dirty_store_);
     auto it = KVStore::dirty_store_.find(key);
     return it != KVStore::dirty_store_.end() && !it->second.empty();
 }
 
-std::optional<Record> CraqReplication::get_dirty_record(const std::string& key,
-                                                        uint64_t version) {
+std::optional<Record> CrownReplication::get_dirty_record(const std::string& key,
+                                                         uint64_t version) {
     std::lock_guard<std::mutex> lock(KVStore::mutex_dirty_store_);
     auto it = KVStore::dirty_store_.find(key);
     if (it == KVStore::dirty_store_.end()) {
@@ -52,12 +52,12 @@ std::optional<Record> CraqReplication::get_dirty_record(const std::string& key,
     return rec_it->second;
 }
 
-void CraqReplication::set_epoch(uint64_t epoch) {
+void CrownReplication::set_epoch(uint64_t epoch) {
     epoch_.store(epoch);
 }
 
-void CraqReplication::update_membership(const std::vector<NodeInfo>& membership,
-                                        const std::string& node_id) {
+void CrownReplication::update_membership(const std::vector<NodeInfo>& membership,
+                                         const std::string& node_id) {
     int ring_size = static_cast<int>(membership.size());
     int node_index = 0;
     for (int i = 0; i < ring_size; ++i) {
@@ -84,7 +84,7 @@ void CraqReplication::update_membership(const std::vector<NodeInfo>& membership,
     next_stub_ = next_stub;
 }
 
-PutResponse CraqReplication::handle_put(PutRequest request) {
+PutResponse CrownReplication::handle_put(PutRequest request) {
     PutResponse response;
     int ring_size = 0;
     int node_index = 0;
@@ -169,7 +169,7 @@ PutResponse CraqReplication::handle_put(PutRequest request) {
     return response;
 }
 
-GetResponse CraqReplication::handle_get(std::string key) {
+GetResponse CrownReplication::handle_get(std::string key) {
     GetResponse response;
     int ring_size = 0;
     int node_index = 0;
@@ -249,7 +249,7 @@ GetResponse CraqReplication::handle_get(std::string key) {
     return response;
 }
 
-void CraqReplication::handle_ack(int64_t request_id) {
+void CrownReplication::handle_ack(int64_t request_id) {
     PutRequest request;
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -289,7 +289,7 @@ void CraqReplication::handle_ack(int64_t request_id) {
     pending_acks.erase(request_id);
 }
 
-VersionQueryResponse CraqReplication::handle_version_query(
+VersionQueryResponse CrownReplication::handle_version_query(
     const VersionQueryRequest& request) {
     VersionQueryResponse response;
     CleanState clean_state = get_committed_state(request.key());

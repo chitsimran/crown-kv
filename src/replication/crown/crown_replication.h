@@ -8,9 +8,9 @@
 #include <mutex>
 #include <vector>
 
-class CraqReplication : public Replication {
+class CrownReplication : public Replication {
 public:
-    CraqReplication() = default;
+    CrownReplication() = default;
 
     void update_membership(const std::vector<replication::NodeInfo>& membership,
                            const std::string& node_id);

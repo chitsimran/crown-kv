@@ -101,6 +101,7 @@ add_executable(server
     src/replication/common/replication_common.cpp
     src/replication/chain/chain_replication.cpp
     src/replication/craq/craq_replication.cpp
+    src/replication/crown/crown_replication.cpp
 )
 target_include_directories(server PRIVATE
     ${CMAKE_SOURCE_DIR}/src

@@ -1,3 +1,5 @@
+#pragma once
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -11,10 +13,12 @@ struct Record {
 };
 
 class CraqReplication;
+class CrownReplication;
 
 class KVStore {
 private:
     friend class CraqReplication;
+    friend class CrownReplication;
     static std::unordered_map<std::string, Record> store_;
     // when you receive an ack for a key, only put it in store if its version is higher than the current version in store
     static std::unordered_map<std::string, std::unordered_map<uint64_t, Record>> dirty_store_;

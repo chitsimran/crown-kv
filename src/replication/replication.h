@@ -1,3 +1,5 @@
+#pragma once
+
 #include "replication.pb.h"
 #include "replication.grpc.pb.h"
 #include "../kv_store/kv_store.h"

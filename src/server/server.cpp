@@ -1,6 +1,7 @@
 #include "replication.grpc.pb.h"
 #include "replication/chain/chain_replication.h"
 #include "replication/craq/craq_replication.h"
+#include "replication/crown/crown_replication.h"
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
@@ -99,11 +100,13 @@ class NodeMetadataService final : public MetadataService::Service {
 public:
     NodeMetadataService(ServerState* state, MetadataClient* metadata_client,
                                                 ChainReplication* chain_replication,
-                                                CraqReplication* craq_replication)
+                                                CraqReplication* craq_replication,
+                                                CrownReplication* crown_replication)
                 : state_(state),
                     metadata_client_(metadata_client),
                     chain_replication_(chain_replication),
-                    craq_replication_(craq_replication) {}
+                    craq_replication_(craq_replication),
+                    crown_replication_(crown_replication) {}
 
     grpc::Status Freeze(grpc::ServerContext*, const FreezeRequest* request,
                         FreezeResponse* response) override {
@@ -141,6 +144,8 @@ public:
         chain_replication_->update_membership(membership_copy, node_id);
         craq_replication_->update_membership(membership_copy, node_id);
         craq_replication_->set_epoch(request->epoch());
+        crown_replication_->update_membership(membership_copy, node_id);
+        crown_replication_->set_epoch(request->epoch());
         response->set_success(true);
         response->set_node_id(state_->node_id);
         return grpc::Status::OK;
@@ -151,15 +156,18 @@ private:
     MetadataClient* metadata_client_;
     ChainReplication* chain_replication_;
     CraqReplication* craq_replication_;
+    CrownReplication* crown_replication_;
 };
 
 class ReplicationGatewayService final : public ReplicationService::Service {
 public:
     ReplicationGatewayService(ServerState* state, ChainReplication* chain_replication,
-                              CraqReplication* craq_replication)
+                                                            CraqReplication* craq_replication,
+                                                            CrownReplication* crown_replication)
         : state_(state),
           chain_replication_(chain_replication),
-          craq_replication_(craq_replication) {}
+                    craq_replication_(craq_replication),
+                    crown_replication_(crown_replication) {}
 
     grpc::Status Put(grpc::ServerContext*, const PutRequest* request,
                      PutResponse* response) override {
@@ -272,11 +280,15 @@ public:
             response->set_error("STALE_EPOCH");
             return grpc::Status::OK;
         }
-        if (mode != "CRAQ") {
+        if (mode != "CRAQ" && mode != "CROWN") {
             response->set_error("WRONG_MODE");
             return grpc::Status::OK;
         }
-        *response = craq_replication_->handle_version_query(*request);
+        if (mode == "CRAQ") {
+            *response = craq_replication_->handle_version_query(*request);
+        } else {
+            *response = crown_replication_->handle_version_query(*request);
+        }
         return grpc::Status::OK;
     }
 
@@ -288,17 +300,22 @@ private:
         if (mode == "CRAQ") {
             return craq_replication_;
         }
+        if (mode == "CROWN") {
+            return crown_replication_;
+        }
         return nullptr;
     }
 
     ServerState* state_;
     ChainReplication* chain_replication_;
     CraqReplication* craq_replication_;
+    CrownReplication* crown_replication_;
 };
 
 void RefreshMembership(ServerState* state, MetadataClient* client,
                        ChainReplication* chain_replication,
-                       CraqReplication* craq_replication) {
+                       CraqReplication* craq_replication,
+                       CrownReplication* crown_replication) {
     MembershipResponse response;
     if (!client->GetMembership(&response)) {
         return;
@@ -319,10 +336,13 @@ void RefreshMembership(ServerState* state, MetadataClient* client,
     chain_replication->update_membership(membership_copy, node_id);
     craq_replication->update_membership(membership_copy, node_id);
     craq_replication->set_epoch(response.epoch());
+    crown_replication->update_membership(membership_copy, node_id);
+    crown_replication->set_epoch(response.epoch());
 }
 
 void HeartbeatLoop(ServerState* state, MetadataClient* client,
                    ChainReplication* chain_replication, CraqReplication* craq_replication,
+                   CrownReplication* crown_replication,
                    std::atomic<bool>* shutdown_flag) {
     while (!shutdown_flag->load()) {
         uint64_t master_epoch = 0;
@@ -333,7 +353,8 @@ void HeartbeatLoop(ServerState* state, MetadataClient* client,
         }
         if (client->SendHeartbeat(state->node_id, local_epoch, &master_epoch)) {
             if (master_epoch > local_epoch) {
-                RefreshMembership(state, client, chain_replication, craq_replication);
+                RefreshMembership(state, client, chain_replication, craq_replication,
+                                  crown_replication);
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(kHeartbeatIntervalMs));
@@ -368,14 +389,16 @@ int main(int argc, char** argv) {
 
     ChainReplication chain_replication;
     CraqReplication craq_replication;
+    CrownReplication crown_replication;
 
     MetadataClient metadata_client(metadata_addr);
-    RefreshMembership(&state, &metadata_client, &chain_replication, &craq_replication);
+    RefreshMembership(&state, &metadata_client, &chain_replication, &craq_replication,
+                      &crown_replication);
 
     NodeMetadataService metadata_service(&state, &metadata_client, &chain_replication,
-                                         &craq_replication);
+                                         &craq_replication, &crown_replication);
     ReplicationGatewayService replication_service(&state, &chain_replication,
-                                                  &craq_replication);
+                                                  &craq_replication, &crown_replication);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&metadata_service);
@@ -388,7 +411,7 @@ int main(int argc, char** argv) {
 
     std::atomic<bool> shutdown_flag{false};
     std::thread heartbeat_thread(HeartbeatLoop, &state, &metadata_client, &chain_replication,
-                                 &craq_replication, &shutdown_flag);
+                                 &craq_replication, &crown_replication, &shutdown_flag);
 
     std::cout << "Server listening on " << listen_addr << std::endl;
     server->Wait();
