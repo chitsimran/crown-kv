@@ -9,6 +9,8 @@ private:
     ReplicationMode mode = ReplicationMode::CHAIN;
     KeyRange head_range;
     KeyRange tail_range;
+    bool _is_head = false;
+    bool _is_tail = false;
     std::optional<std::unique_ptr<ReplicationService::Stub>> prev;
     std::optional<std::unique_ptr<ReplicationService::Stub>> next;
     std::vector<KeyRange> key_ranges;
