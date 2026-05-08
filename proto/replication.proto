@@ -133,6 +133,16 @@ message HeartbeatResponse {
     uint64 epoch = 2;
 }
 
+message ReportFailureRequest {
+    string reporter_node_id = 1;
+    string failed_node_id = 2;
+    uint64 epoch = 3;
+}
+
+message ReportFailureResponse {
+    bool success = 1;
+}
+
 message MembershipRequest {}
 
 message MembershipResponse {
@@ -153,7 +163,7 @@ service ReplicationService {
 }
 
 service ClientAckService {
-    rpc CommitAckMsg (CommitAck) returns (CommitAckResponse);
+    rpc CommitAck (.replication.CommitAck) returns (.replication.CommitAckResponse);
 }
 
 service MetadataService {
@@ -162,5 +172,6 @@ service MetadataService {
     rpc Reconfigure (ReconfigureRequest) returns (ReconfigureResponse);
     rpc ReportDrainAck (DrainAckRequest) returns (DrainAckResponse);
     rpc ReportSyncDone (SyncCompleteRequest) returns (SyncCompleteResponse);
+    rpc ReportFailure (ReportFailureRequest) returns (ReportFailureResponse);
     rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }

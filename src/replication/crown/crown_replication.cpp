@@ -128,7 +128,9 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
         if (node_index == tail_index || !next_stub) {
             kv_store.mark_clean(request.key(), assigned_version);
             add_to_pending_acks(request);
-            send_ack(request.request_id(), prev_stub);
+            if (prev_stub) {
+                send_ack(request.request_id(), prev_stub);
+            }
             send_ack(request.request_id(), nullptr);
             {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -152,7 +154,9 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
             kv_store.mark_clean(request.key(), request.version());
         }
         add_to_pending_acks(request);
-        send_ack(request.request_id(), prev_stub);
+        if (prev_stub) {
+            send_ack(request.request_id(), prev_stub);
+        }
         send_ack(request.request_id(), nullptr);
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -257,7 +261,7 @@ void CrownReplication::handle_ack(int64_t request_id) {
         if (it == pending_acks.end()) {
             return;
         }
-        request = it->second;
+        request = it->second.request;
     }
 
     kv_store.mark_clean(request.key(), request.version());
@@ -289,9 +293,30 @@ void CrownReplication::handle_ack(int64_t request_id) {
     pending_acks.erase(request_id);
 }
 
+std::shared_ptr<ReplicationService::Stub> CrownReplication::get_next_stub() {
+    std::lock_guard<std::mutex> lock(ring_mutex_);
+    return next_stub_;
+}
+
 VersionQueryResponse CrownReplication::handle_version_query(
     const VersionQueryRequest& request) {
     VersionQueryResponse response;
+    int ring_size = 0;
+    int node_index = 0;
+    {
+        std::lock_guard<std::mutex> lock(ring_mutex_);
+        ring_size = ring_size_;
+        node_index = node_index_;
+    }
+    if (ring_size == 0) {
+        response.set_error("NO_MEMBERSHIP");
+        return response;
+    }
+    int tail_index = replication_common::tail_index(request.key(), ring_size);
+    if (node_index != tail_index) {
+        response.set_error("WRONG_NODE");
+        return response;
+    }
     CleanState clean_state = get_committed_state(request.key());
     response.set_committed_version(clean_state.version);
     if (!clean_state.found) {

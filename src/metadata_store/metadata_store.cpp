@@ -25,6 +25,8 @@ using replication::MetadataService;
 using replication::NodeInfo;
 using replication::ReconfigureRequest;
 using replication::ReconfigureResponse;
+using replication::ReportFailureRequest;
+using replication::ReportFailureResponse;
 using replication::SyncCompleteRequest;
 using replication::SyncCompleteResponse;
 
@@ -46,6 +48,9 @@ struct ClusterState {
     std::condition_variable drain_cv;
     std::atomic<bool> reconfig_in_progress{false};
 };
+
+void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_node_id);
+void TriggerReconfigureAdd(ClusterState* state, const NodeInfo& added_node);
 
 bool ParseHostPort(const std::string& text, std::string* host, int* port) {
     auto pos = text.rfind(':');
@@ -139,6 +144,13 @@ public:
         return grpc::Status::OK;
     }
 
+    grpc::Status ReportFailure(grpc::ServerContext*, const ReportFailureRequest* request,
+                               ReportFailureResponse* response) override {
+        response->set_success(true);
+        std::thread(TriggerReconfigureRemove, state_, request->failed_node_id()).detach();
+        return grpc::Status::OK;
+    }
+
 private:
     ClusterState* state_;
 };
@@ -163,13 +175,15 @@ bool SendFreeze(const NodeInfo& node, uint64_t epoch,
 
 bool SendReconfigure(const NodeInfo& node, uint64_t epoch,
                      const std::vector<NodeInfo>& membership, const std::string& mode,
-                     const std::string& removed_node_id) {
+                     const std::string& removed_node_id,
+                     const std::string& added_node_id = "") {
     auto channel = grpc::CreateChannel(ToAddress(node), grpc::InsecureChannelCredentials());
     auto stub = MetadataService::NewStub(channel);
     ReconfigureRequest request;
     request.set_epoch(epoch);
     request.set_mode(mode);
     request.set_removed_node_id(removed_node_id);
+    request.set_added_node_id(added_node_id);
     for (const auto& member : membership) {
         *request.add_membership() = member;
     }
@@ -193,20 +207,100 @@ void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_nod
         old_epoch = state->epoch;
         mode = state->mode;
         old_membership = state->membership;
+        bool found_failed_node = false;
         for (const auto& member : state->membership) {
             if (member.node_id() != failed_node_id) {
                 new_membership.push_back(member);
+            } else {
+                found_failed_node = true;
             }
+        }
+        if (!found_failed_node) {
+            state->reconfig_in_progress.store(false);
+            return;
         }
         state->drain_epoch = old_epoch;
         state->expected_drain_acks = new_membership.size();
         state->drain_acks.clear();
     }
 
+    std::vector<NodeInfo> freeze_confirmed_membership;
     for (const auto& node : old_membership) {
         if (node.node_id() == failed_node_id) {
             continue;
         }
+        if (SendFreeze(node, old_epoch, new_membership)) {
+            for (const auto& candidate : new_membership) {
+                if (candidate.node_id() == node.node_id()) {
+                    freeze_confirmed_membership.push_back(candidate);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (freeze_confirmed_membership.empty()) {
+        freeze_confirmed_membership = new_membership;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->expected_drain_acks = freeze_confirmed_membership.size();
+        if (state->expected_drain_acks > 0) {
+            state->drain_cv.wait_for(
+                lock, std::chrono::milliseconds(kFreezeAckTimeoutMs), [&]() {
+                    return state->drain_acks.size() >= state->expected_drain_acks;
+                });
+        }
+        state->epoch = old_epoch + 1;
+        state->membership = freeze_confirmed_membership;
+        state->last_heartbeat.erase(failed_node_id);
+        std::unordered_set<std::string> live_ids;
+        for (const auto& member : state->membership) {
+            live_ids.insert(member.node_id());
+        }
+        for (const auto& member : old_membership) {
+            if (live_ids.count(member.node_id()) == 0) {
+                state->last_heartbeat.erase(member.node_id());
+            }
+        }
+        state->reconfig_in_progress.store(false);
+        new_membership = state->membership;
+    }
+
+    for (const auto& node : new_membership) {
+        SendReconfigure(node, old_epoch + 1, new_membership, mode, failed_node_id);
+    }
+}
+
+void TriggerReconfigureAdd(ClusterState* state, const NodeInfo& added_node) {
+    std::vector<NodeInfo> old_membership;
+    std::vector<NodeInfo> new_membership;
+    uint64_t old_epoch = 0;
+    std::string mode;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->reconfig_in_progress.exchange(true)) {
+            return;
+        }
+        old_epoch = state->epoch;
+        mode = state->mode;
+        old_membership = state->membership;
+        new_membership = state->membership;
+        for (const auto& member : new_membership) {
+            if (member.node_id() == added_node.node_id()) {
+                state->reconfig_in_progress.store(false);
+                return;
+            }
+        }
+        new_membership.push_back(added_node);
+        state->drain_epoch = old_epoch;
+        state->expected_drain_acks = old_membership.size();
+        state->drain_acks.clear();
+    }
+
+    for (const auto& node : old_membership) {
         SendFreeze(node, old_epoch, new_membership);
     }
 
@@ -220,12 +314,13 @@ void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_nod
         }
         state->epoch = old_epoch + 1;
         state->membership = new_membership;
-        state->last_heartbeat.erase(failed_node_id);
+        state->last_heartbeat[added_node.node_id()] = std::chrono::steady_clock::now();
         state->reconfig_in_progress.store(false);
     }
 
     for (const auto& node : new_membership) {
-        SendReconfigure(node, old_epoch + 1, new_membership, mode, failed_node_id);
+        SendReconfigure(node, old_epoch + 1, new_membership, mode, "",
+                        added_node.node_id());
     }
 }
 
@@ -260,6 +355,8 @@ int main(int argc, char** argv) {
     std::string listen_addr = "0.0.0.0:50050";
     std::string mode = "CROWN";
     std::string members_arg;
+    std::string add_member_arg;
+    int add_after_ms = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -269,6 +366,10 @@ int main(int argc, char** argv) {
             mode = argv[++i];
         } else if (arg == "--members" && i + 1 < argc) {
             members_arg = argv[++i];
+        } else if (arg == "--add-member" && i + 1 < argc) {
+            add_member_arg = argv[++i];
+        } else if (arg == "--add-after-ms" && i + 1 < argc) {
+            add_after_ms = std::stoi(argv[++i]);
         }
     }
 
@@ -298,11 +399,28 @@ int main(int argc, char** argv) {
 
     std::atomic<bool> shutdown_flag{false};
     std::thread monitor_thread(MonitorFailures, &state, &shutdown_flag);
+    std::thread add_thread;
+    if (!add_member_arg.empty()) {
+        NodeInfo added_node;
+        if (!ParseMember(add_member_arg, &added_node)) {
+            std::cerr << "Invalid add-member entry: " << add_member_arg << std::endl;
+            return 1;
+        }
+        add_thread = std::thread([&state, added_node, add_after_ms]() {
+            if (add_after_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(add_after_ms));
+            }
+            TriggerReconfigureAdd(&state, added_node);
+        });
+    }
 
     std::cout << "metadata_store listening on " << listen_addr << std::endl;
     server->Wait();
 
     shutdown_flag.store(true);
     monitor_thread.join();
+    if (add_thread.joinable()) {
+        add_thread.join();
+    }
     return 0;
 }

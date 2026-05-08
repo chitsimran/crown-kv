@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(crown CXX)
 
+enable_testing()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +18,7 @@ endif()
 # Let gRPC pull in protobuf itself — do NOT call find_package(Protobuf)
 # separately, it causes target redefinition conflicts on Homebrew.
 find_package(gRPC REQUIRED)
+find_package(Threads REQUIRED)
 
 include(FetchContent)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
@@ -141,3 +144,31 @@ target_include_directories(metadata_store PRIVATE
 target_link_libraries(metadata_store PRIVATE
     replication
 )
+
+add_executable(unit_tests
+    tests/unit_tests.cpp
+    src/kv_store/kv_store.cpp
+)
+target_include_directories(unit_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(unit_tests PRIVATE Threads::Threads)
+add_test(NAME unit_tests COMMAND unit_tests)
+
+add_executable(protocol_tests
+    tests/protocol_tests.cpp
+    src/kv_store/kv_store.cpp
+    src/replication/common/replication_common.cpp
+    src/replication/chain/chain_replication.cpp
+    src/replication/craq/craq_replication.cpp
+    src/replication/crown/crown_replication.cpp
+)
+target_include_directories(protocol_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${PROTO_GEN_DIR}
+)
+target_link_libraries(protocol_tests PRIVATE
+    replication
+    Threads::Threads
+)
+add_test(NAME protocol_tests COMMAND protocol_tests)

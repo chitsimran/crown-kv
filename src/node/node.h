@@ -11,7 +11,4 @@ public:
     std::shared_ptr<replication::ReplicationService::Stub> prev;
     std::shared_ptr<replication::ReplicationService::Stub> next;
 public:
-    bool is_head(std::string& key);
-
-    bool is_tail(std::string& key);
 };

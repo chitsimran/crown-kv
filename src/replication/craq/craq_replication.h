@@ -19,6 +19,7 @@ public:
     PutResponse handle_put(PutRequest request) override;
     GetResponse handle_get(std::string key) override;
     void handle_ack(int64_t request_id) override;
+    std::shared_ptr<ReplicationService::Stub> get_next_stub() override;
 
     replication::VersionQueryResponse handle_version_query(
         const replication::VersionQueryRequest& request);

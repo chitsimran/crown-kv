@@ -174,7 +174,7 @@ void ChainReplication::handle_ack(int64_t request_id) {
         if (it == pending_acks.end()) {
             return;
         }
-        request = it->second;
+        request = it->second.request;
     }
 
     kv_store.mark_clean(request.key(), request.version());
@@ -204,4 +204,9 @@ void ChainReplication::handle_ack(int64_t request_id) {
 
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_acks.erase(request_id);
+}
+
+std::shared_ptr<ReplicationService::Stub> ChainReplication::get_next_stub() {
+    std::lock_guard<std::mutex> lock(ring_mutex_);
+    return next_stub_;
 }

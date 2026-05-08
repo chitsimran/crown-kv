@@ -3,10 +3,13 @@
 #include "replication.pb.h"
 #include "replication.grpc.pb.h"
 #include "../kv_store/kv_store.h"
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 using replication::GetResponse;
 using replication::PutRequest;
@@ -15,6 +18,11 @@ using replication::ReplicationService;
 
 class Replication {
 public:
+    struct PendingEntry {
+        PutRequest request;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
     KVStore kv_store;
     
     // passed on by server in constructor // key -> head node
@@ -23,10 +31,16 @@ public:
     // passed on by server in constructor // key -> tail node
     std::unordered_map<char, std::shared_ptr<ReplicationService::Stub>> key_tail_mapping;
 
-    std::unordered_map<int64_t, PutRequest> pending_acks; // request_id -> request
+    std::unordered_map<int64_t, PendingEntry> pending_acks; // request_id -> entry
     std::mutex pending_mutex_;
+    std::function<void(const PutRequest&)> forward_failure_handler;
 
     void add_to_pending_acks(PutRequest request);
+    void erase_pending_ack(int64_t request_id);
+
+    size_t pending_count();
+    std::vector<PutRequest> snapshot_pending_requests();
+    std::vector<PutRequest> collect_expired_requests();
 
     // asynchronously forward the put request to the next node, and add it to pending_acks until you receive an ack for it
     void forward_put(PutRequest request, const std::shared_ptr<ReplicationService::Stub>& next_stub);
@@ -40,4 +54,6 @@ public:
     virtual GetResponse handle_get(std::string key) = 0;
 
     virtual void handle_ack(int64_t request_id) = 0;
+
+    virtual std::shared_ptr<ReplicationService::Stub> get_next_stub() = 0;
 };

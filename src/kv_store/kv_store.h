@@ -6,6 +6,8 @@
 #include <sys/types.h>
 #include <unordered_map>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 struct Record {
     uint64_t verison = 0;
@@ -36,4 +38,10 @@ public:
 
     // only put it in clean store if its version is higher than the current version in store
     static void mark_clean(const std::string& key, uint64_t version);
+
+    static std::vector<std::pair<std::string, Record>> snapshot_committed();
+
+    static void apply_committed_snapshot(
+        const std::unordered_map<std::string, std::string>& values,
+        const std::unordered_map<std::string, uint64_t>& versions);
 };
