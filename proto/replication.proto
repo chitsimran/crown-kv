@@ -1,85 +1,166 @@
 syntax = "proto3";
-import "google/protobuf/empty.proto";
-
-message NodeAddress {
-    string host = 1;
-    int32  port = 2;
-}
-
-message KeyRange {
-    uint64               start = 1;
-    uint64               end   = 2;
-    optional NodeAddress owner = 3;
-}
-
-message NodeConfig {
-    int32           node_id     = 1;
-    NodeAddress     self_addr   = 2;
-    ReplicationMode mode        = 3;
-    KeyRange        head_range  = 4; // 0-0
-    KeyRange        tail_range  = 5;
-
-    optional NodeAddress prev   = 6;  // absent = no predecessor (head)
-    optional NodeAddress next   = 7;  // absent = no successor (tail)
-    repeated KeyRange    ranges = 8;
-    optional NodeAddress tail   = 9;  // might not be required
-}
-
-enum ReplicationMode {
-    CHAIN = 0;
-    CRAQ  = 1;
-    CROWN = 2;
-}
+package replication;
 
 message PutRequest {
     uint64 request_id = 1;
     string key = 2;
     string value = 3;
-    string source_ip = 4;
-    uint64 version = 5; // if version is 0, it means the request is from client to head, else its from server to server
+    uint64 version = 4;   // 0 = from client; >0 = replica-to-replica
+    string client_addr = 5;
+    uint64 epoch = 6;
 }
 
 message PutResponse {
-    bool   success = 1;
-    uint64 version = 2;
+    bool success = 1;
+    string error = 2;
+    uint64 version = 3;
 }
 
 message GetRequest {
     string key = 1;
+    uint64 epoch = 2;
 }
 
 message GetResponse {
-    string key     = 1;
-    string value   = 2;
+    string value = 1;
+    uint64 version = 2;
+    string error = 3;
+}
+
+message WriteAck {
+    uint64 request_id = 1;
+    string key = 2;
     uint64 version = 3;
+    uint64 epoch = 4;
+}
+
+message WriteAckResponse {
+    bool success = 1;
+}
+
+message CommitAck {
+    string key = 1;
+    uint64 version = 2;
+}
+
+message CommitAckResponse {
+    bool success = 1;
 }
 
 message VersionQueryRequest {
     string key = 1;
+    uint64 epoch = 2;
 }
 
 message VersionQueryResponse {
-    string key             = 1;
-    uint64 latest_version  = 2; // latest committed (clean) version at the tail
+    uint64 committed_version = 1;
+    string error = 2;
 }
 
-message AckRequest {
-    string key     = 1;
-    uint64 version = 2;
-    string client_addr = 3; // client identity/address for async commit correlation
-    uint64 request_id  = 4; // request correlation id from original write
+message NodeInfo {
+    string node_id = 1;
+    string address = 2;
+    int32 port = 3;
+}
+
+message FreezeRequest {
+    uint64 epoch = 1;
+    repeated NodeInfo v_new = 2;
+}
+
+message FreezeResponse {
+    bool success = 1;
+    string node_id = 2;
+}
+
+message DrainAckRequest {
+    string node_id = 1;
+    uint64 epoch = 2;
+}
+
+message DrainAckResponse {
+    bool success = 1;
+}
+
+message ReconfigureRequest {
+    uint64 epoch = 1;
+    repeated NodeInfo membership = 2;
+    string mode = 3;
+    string removed_node_id = 4;
+    string added_node_id = 5;
+}
+
+message ReconfigureResponse {
+    bool success = 1;
+    string node_id = 2;
 }
 
 message InflightRequest {
-    uint64 node_id = 1;
+    string origin_node_id = 1;
+    uint64 epoch = 2;
+}
+
+message InflightResponse {
+    bool success = 1;
+}
+
+message StateDumpRequest {
+    uint64 epoch = 1;
+}
+
+message StateDumpResponse {
+    map<string, string> kv_data = 1;
+    map<string, uint64> version_data = 2;
+    uint64 epoch = 3;
+}
+
+message SyncCompleteRequest {
+    string node_id = 1;
+    uint64 epoch = 2;
+}
+
+message SyncCompleteResponse {
+    bool success = 1;
+}
+
+message HeartbeatRequest {
+    string node_id = 1;
+    uint64 epoch = 2;
+}
+
+message HeartbeatResponse {
+    bool alive = 1;
+    uint64 epoch = 2;
+}
+
+message MembershipRequest {}
+
+message MembershipResponse {
+    uint64 epoch = 1;
+    repeated NodeInfo membership = 2;
+    string mode = 3;
 }
 
 service ReplicationService {
-    rpc Configure    (NodeConfig)        returns (google.protobuf.Empty);
-    rpc Put          (PutRequest)        returns (PutResponse);
-    rpc Get          (GetRequest)        returns (GetResponse);
-    rpc Ack          (AckRequest)        returns (google.protobuf.Empty);
-    rpc Inflight     (InflightRequest)   returns (google.protobuf.Empty);
-    // CRAQ and CROWN
+    rpc Put (PutRequest) returns (PutResponse);
+    rpc Get (GetRequest) returns (GetResponse);
+
+    rpc ForwardPut (PutRequest) returns (PutResponse);
+    rpc SendWriteAck (WriteAck) returns (WriteAckResponse);
     rpc VersionQuery (VersionQueryRequest) returns (VersionQueryResponse);
+    rpc ForwardInflight (InflightRequest) returns (InflightResponse);
+    rpc StateDump (StateDumpRequest) returns (StateDumpResponse);
+}
+
+service ClientAckService {
+    rpc CommitAckMsg (CommitAck) returns (CommitAckResponse);
+}
+
+service MetadataService {
+    rpc GetMembership (MembershipRequest) returns (MembershipResponse);
+    rpc Freeze (FreezeRequest) returns (FreezeResponse);
+    rpc Reconfigure (ReconfigureRequest) returns (ReconfigureResponse);
+    rpc ReportDrainAck (DrainAckRequest) returns (DrainAckResponse);
+    rpc ReportSyncDone (SyncCompleteRequest) returns (SyncCompleteResponse);
+    rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }

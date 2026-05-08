@@ -97,6 +97,9 @@ target_include_directories(replication PUBLIC
 
 add_executable(server
     src/server/server.cpp
+    src/kv_store/kv_store.cpp
+    src/replication/common/replication_common.cpp
+    src/replication/chain/chain_replication.cpp
 )
 target_include_directories(server PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -120,4 +123,19 @@ target_include_directories(client PRIVATE
 target_link_libraries(client PRIVATE
     replication
     nlohmann_json::nlohmann_json
+)
+
+# ============================================================
+# Metadata store executable
+# ============================================================
+
+add_executable(metadata_store
+    src/metadata_store/metadata_store.cpp
+)
+target_include_directories(metadata_store PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${PROTO_GEN_DIR}
+)
+target_link_libraries(metadata_store PRIVATE
+    replication
 )

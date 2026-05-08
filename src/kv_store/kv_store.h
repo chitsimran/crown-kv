@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <sys/types.h>
 #include <unordered_map>
@@ -11,15 +12,15 @@ struct Record {
 
 class KVStore {
 private:
-    std::unordered_map<std::string, Record> store_;
+    static std::unordered_map<std::string, Record> store_;
     // when you receive an ack for a key, only put it in store if its version is higher than the current version in store
-    std::unordered_map<std::string, std::unordered_map<uint64_t, Record>> dirty_store_;
-    std::mutex mutex_store_;
-    std::mutex mutex_dirty_store_;
+    static std::unordered_map<std::string, std::unordered_map<uint64_t, Record>> dirty_store_;
+    static std::mutex mutex_store_;
+    static std::mutex mutex_dirty_store_;
 public:
     // only put if version > latest version
     // if version == null, it means the request is from client to head, so we can just assign it a new version that is higher than the current version in store
-    static void put(const std::string& key, const std::string& value, std::optional<uint64_t> version);
+    static uint64_t put(const std::string& key, const std::string& value, std::optional<uint64_t> version);
 
     static std::optional<std::string> get(const std::string& key);
 
@@ -27,5 +28,5 @@ public:
     static uint64_t get_latest_version(const std::string& key);
 
     // only put it in clean store if its version is higher than the current version in store
-    static void mark_clean(const std::string& key, int version);
+    static void mark_clean(const std::string& key, uint64_t version);
 };

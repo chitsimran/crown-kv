@@ -1,19 +1,15 @@
-#include "../proto/replication.pb.h"
-#include "proto/replication.grpc.pb.h"
+#include "replication.pb.h"
+#include "replication.grpc.pb.h"
+#include <memory>
+#include <string>
 
 class Node {
 private:
-    int node_id;
-    public:
-    NodeAddress my_address;
-    ReplicationMode mode = ReplicationMode::CHAIN;
-    KeyRange head_range;
-    KeyRange tail_range;
-    bool _is_head = false;
-    bool _is_tail = false;
-    std::optional<std::unique_ptr<ReplicationService::Stub>> prev;
-    std::optional<std::unique_ptr<ReplicationService::Stub>> next;
-    std::vector<KeyRange> key_ranges;
+    int node_id = 0;
+public:
+    int ring_size = 0;
+    std::shared_ptr<replication::ReplicationService::Stub> prev;
+    std::shared_ptr<replication::ReplicationService::Stub> next;
 public:
     bool is_head(std::string& key);
 
