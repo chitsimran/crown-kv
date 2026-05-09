@@ -2,9 +2,11 @@
 #include "replication/common/replication_common.h"
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -290,7 +292,12 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [key] [value]      Single-threaded async open-loop writes\n"
+        << "  bench N [csv] [hot%] [hot-set%]\n"
+        << "                             Single-threaded async open-loop writes from a\n"
+        << "                             CSV produced by setup/generate_kv_dataset.py.\n"
+        << "                             hot% is the share of writes targeting hot keys;\n"
+        << "                             hot-set% is the share of unique keys in the hot\n"
+        << "                             pool. The dataset is loaded once and cached.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -351,6 +358,77 @@ bool WaitForCommit(ClientState* state, const PendingKey& pending_key, int timeou
     return state->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]() {
         return state->pending.find(pending_key) == state->pending.end();
     });
+}
+
+// Loads a CSV produced by setup/generate_kv_dataset.py. The file has a header
+// row "key,value" followed by alphabetic 10-byte keys and 64-byte values. We
+// read every row eagerly so the bench command never builds keys on the fly.
+bool LoadDatasetCsv(const std::string& path,
+                    std::vector<std::pair<std::string, std::string>>* out) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "failed to open dataset file: " << path << std::endl;
+        return false;
+    }
+    out->clear();
+    std::string line;
+    bool header = true;
+    while (std::getline(file, line)) {
+        if (header) {
+            header = false;
+            continue;
+        }
+        if (line.empty()) {
+            continue;
+        }
+        auto comma = line.find(',');
+        if (comma == std::string::npos) {
+            continue;
+        }
+        out->emplace_back(line.substr(0, comma), line.substr(comma + 1));
+    }
+    return !out->empty();
+}
+
+// Mirrors apply_hot_skew in setup/generate_kv_dataset.py: hot_share% of writes
+// are drawn from the first hot_set_share% of the dataset (the "hot pool"), the
+// remainder cycles through the rest. Hot rows come first, then cold rows —
+// matching the python script so behavior is consistent across pre-baked CSVs
+// and client-side skewing.
+std::vector<std::pair<std::string, std::string>> BuildSkewedWorkload(
+    const std::vector<std::pair<std::string, std::string>>& dataset,
+    uint64_t total_count, int hot_share, int hot_set_share) {
+    std::vector<std::pair<std::string, std::string>> workload;
+    if (dataset.empty() || total_count == 0) {
+        return workload;
+    }
+    workload.reserve(total_count);
+    if (hot_share <= 0) {
+        for (uint64_t i = 0; i < total_count; ++i) {
+            workload.push_back(dataset[i % dataset.size()]);
+        }
+        return workload;
+    }
+    uint64_t hot_count = std::max<uint64_t>(1, total_count * hot_share / 100);
+    uint64_t cold_count = total_count - hot_count;
+    size_t hot_set_size = std::max<size_t>(
+        1, dataset.size() * static_cast<size_t>(hot_set_share) / 100);
+    if (hot_set_size > dataset.size()) {
+        hot_set_size = dataset.size();
+    }
+    size_t cold_pool_size = dataset.size() - hot_set_size;
+
+    for (uint64_t i = 0; i < hot_count; ++i) {
+        workload.push_back(dataset[i % hot_set_size]);
+    }
+    for (uint64_t i = 0; i < cold_count; ++i) {
+        if (cold_pool_size == 0) {
+            workload.push_back(dataset[i % hot_set_size]);
+        } else {
+            workload.push_back(dataset[hot_set_size + (i % cold_pool_size)]);
+        }
+    }
+    return workload;
 }
 
 void PrintClientStats(ClientState* state) {
@@ -449,12 +527,64 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
         } else if (command == "bench") {
             if (words.size() < 2) {
-                std::cout << "usage: bench N [key-prefix] [value-prefix]" << std::endl;
+                std::cout << "usage: bench N [csv-path] [hot-share%] [hot-set-share%]\n"
+                          << "  csv-path     defaults to setup/generated_kv_dataset/all_kv_pairs.csv\n"
+                          << "  hot-share    0-100, percentage of writes targeting hot keys (default 0)\n"
+                          << "  hot-set-share 1-100, percentage of unique keys in the hot pool (default 10)"
+                          << std::endl;
                 continue;
             }
             uint64_t count = std::stoull(words[1]);
-            std::string key_prefix = words.size() >= 3 ? words[2] : "key";
-            std::string value_prefix = words.size() >= 4 ? words[3] : "value";
+            std::string csv_path = words.size() >= 3
+                ? words[2]
+                : std::string("setup/generated_kv_dataset/all_kv_pairs.csv");
+            int hot_share = words.size() >= 4 ? std::stoi(words[3]) : 0;
+            int hot_set_share = words.size() >= 5 ? std::stoi(words[4]) : 10;
+            if (hot_share < 0 || hot_share > 100) {
+                std::cout << "hot-share must be 0-100" << std::endl;
+                continue;
+            }
+            if (hot_set_share < 1 || hot_set_share > 100) {
+                std::cout << "hot-set-share must be 1-100" << std::endl;
+                continue;
+            }
+
+            // Cache the dataset across bench invocations: re-reading 20K+ rows
+            // from disk per call is wasteful and noisy. Reload only on path change.
+            static std::string cached_path;
+            static std::vector<std::pair<std::string, std::string>> cached_dataset;
+            if (csv_path != cached_path || cached_dataset.empty()) {
+                auto load_start = std::chrono::steady_clock::now();
+                if (!LoadDatasetCsv(csv_path, &cached_dataset)) {
+                    cached_path.clear();
+                    cached_dataset.clear();
+                    std::cout << "bench aborted: could not load dataset" << std::endl;
+                    continue;
+                }
+                cached_path = csv_path;
+                auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - load_start).count();
+                std::cout << "loaded " << cached_dataset.size() << " rows from "
+                          << csv_path << " (" << load_ms << " ms)" << std::endl;
+            }
+
+            // Build the full workload before any timing starts. Once the timed
+            // section opens, no more key/value materialization happens.
+            auto build_start = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::string, std::string>> workload =
+                BuildSkewedWorkload(cached_dataset, count, hot_share, hot_set_share);
+            if (workload.size() != count) {
+                std::cout << "bench aborted: workload empty (dataset size="
+                          << cached_dataset.size() << ")" << std::endl;
+                continue;
+            }
+            auto build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - build_start).count();
+            std::cout << "prepared workload: count=" << count
+                      << " hot_share=" << hot_share << "%"
+                      << " hot_set_share=" << hot_set_share << "%"
+                      << " (" << build_ms << " ms)" << std::endl;
+
             uint64_t start_completed = 0;
             uint64_t accepted = 0;
             {
@@ -471,13 +601,6 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 grpc::Status status;
                 std::unique_ptr<grpc::ClientAsyncResponseReader<PutResponse>> rpc;
             };
-
-            std::vector<std::pair<std::string, std::string>> workload;
-            workload.reserve(count);
-            for (uint64_t i = 0; i < count; ++i) {
-                workload.emplace_back(key_prefix + std::to_string(i),
-                                      value_prefix + std::to_string(i));
-            }
 
             grpc::CompletionQueue completion_queue;
             std::vector<std::unique_ptr<AsyncPutCall>> calls;
