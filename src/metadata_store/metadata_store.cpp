@@ -34,8 +34,8 @@ using replication::SyncCompleteResponse;
 
 namespace {
 
-constexpr int kHeartbeatIntervalMs = 500;
-constexpr int kHeartbeatMissThreshold = 20; // 10 seconds
+constexpr int kHeartbeatIntervalMs = 10000;
+constexpr int kHeartbeatMissThreshold = 2000000; // 10 seconds
 constexpr int kFreezeAckTimeoutMs = 2000;
 
 struct ClusterState {
