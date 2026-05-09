@@ -443,6 +443,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             std::vector<std::unique_ptr<AsyncPutCall>> calls;
             calls.reserve(count);
             uint64_t failed = 0;
+            auto rpc_deadline = std::chrono::system_clock::now() + std::chrono::seconds(30);
             auto bench_start = std::chrono::steady_clock::now();
             for (uint64_t i = 0; i < count; ++i) {
                 int index = SelectWriteNodeIndex(*membership, workload[i].first);
@@ -455,6 +456,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 call->index = i;
                 call->key = workload[i].first;
                 call->entry = PendingEntry{std::chrono::steady_clock::now()};
+                call->context.set_deadline(rpc_deadline);
 
                 PutRequest request;
                 request.set_request_id((*request_id)++);
@@ -465,8 +467,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 request.set_epoch(membership->epoch);
 
                 auto* tag = call.get();
-                call->rpc = membership->stubs[index]->AsyncPut(&call->context, request,
-                                                               &completion_queue);
+                call->rpc = membership->stubs[index]->PrepareAsyncPut(
+                    &call->context, request, &completion_queue);
+                call->rpc->StartCall();
                 call->rpc->Finish(&call->response, &call->status, tag);
                 calls.push_back(std::move(call));
             }
