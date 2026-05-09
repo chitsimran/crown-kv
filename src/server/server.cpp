@@ -854,9 +854,9 @@ int main(int argc, char** argv) {
     CrownReplication crown_replication;
 
     MetadataClient metadata_client(metadata_addr);
-    // InstallForwardFailureHandler(&state, &metadata_client, &chain_replication);
-    // InstallForwardFailureHandler(&state, &metadata_client, &craq_replication);
-    // InstallForwardFailureHandler(&state, &metadata_client, &crown_replication);
+    InstallForwardFailureHandler(&state, &metadata_client, &chain_replication);
+    InstallForwardFailureHandler(&state, &metadata_client, &craq_replication);
+    InstallForwardFailureHandler(&state, &metadata_client, &crown_replication);
     RefreshMembership(&state, &metadata_client, &chain_replication, &craq_replication,
                       &crown_replication);
 
