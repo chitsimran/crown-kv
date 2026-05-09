@@ -144,13 +144,21 @@ start_metadata() {
     fi
     pkill -u "$DEPLOY_USER" -f "metadata_store .*--listen .*:${METADATA_PORT}" >/dev/null 2>&1 || true
 
+    : > "$log_file"
+    : > "$out_file"
+
     local metadata_cmd
-    metadata_cmd="cd '$PROJECT_DIR' && exec build/metadata_store --listen 0.0.0.0:${METADATA_PORT} --mode '${PROTOCOL_MODE}' --members '${MEMBERS_ARG}'"
+    metadata_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/metadata_store --listen 0.0.0.0:${METADATA_PORT} --mode ${PROTOCOL_MODE} --members ${MEMBERS_ARG}' && exec build/metadata_store --listen 0.0.0.0:${METADATA_PORT} --mode '${PROTOCOL_MODE}' --members '${MEMBERS_ARG}' 2>&1"
     echo "Run command: $metadata_cmd"
-    printf '[launch] %s\n' "$metadata_cmd" | tee -a "$log_file" >> "$out_file"
-    "${tmux_cmd[@]}" new-session -d -s "$SESSION_NAME" "$metadata_cmd"
+    {
+        echo "[launch] $(date -Is)"
+        echo "[host] $(hostname -f 2>/dev/null || hostname)"
+        echo "[session] $SESSION_NAME"
+        echo "[cmd] $metadata_cmd"
+    } | tee -a "$log_file" >> "$out_file"
+    "${tmux_cmd[@]}" new-session -d -s "$SESSION_NAME" "bash -lc $(printf '%q' "$metadata_cmd")"
     chmod 666 "$TMUX_SOCKET" 2>/dev/null || true
-    "${tmux_cmd[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat | tee -a '$log_file' >> '$out_file'"
+    "${tmux_cmd[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$log_file'"
     "${tmux_cmd[@]}" display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}" > "$pid_file"
 
     echo "Metadata started in tmux session: $SESSION_NAME"

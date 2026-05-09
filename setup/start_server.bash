@@ -145,13 +145,21 @@ start_server() {
     fi
     pkill -u "$DEPLOY_USER" -f "server .*--node-id ${NODE_ID} .*--listen .*:${NODE_PORT}" >/dev/null 2>&1 || true
 
+    : > "$log_file"
+    : > "$out_file"
+
     local server_cmd
-    server_cmd="cd '$PROJECT_DIR' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}'"
+    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR}' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}' 2>&1"
     echo "Run command: $server_cmd"
-    printf '[launch] %s\n' "$server_cmd" | tee -a "$log_file" >> "$out_file"
-    "${tmux_cmd[@]}" new-session -d -s "$SESSION_NAME" "$server_cmd"
+    {
+        echo "[launch] $(date -Is)"
+        echo "[host] $(hostname -f 2>/dev/null || hostname)"
+        echo "[session] $SESSION_NAME"
+        echo "[cmd] $server_cmd"
+    } | tee -a "$log_file" >> "$out_file"
+    "${tmux_cmd[@]}" new-session -d -s "$SESSION_NAME" "bash -lc $(printf '%q' "$server_cmd")"
     chmod 666 "$TMUX_SOCKET" 2>/dev/null || true
-    "${tmux_cmd[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat | tee -a '$log_file' >> '$out_file'"
+    "${tmux_cmd[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$log_file'"
     "${tmux_cmd[@]}" display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}" > "$pid_file"
 
     echo "Server started in tmux session: $SESSION_NAME"
