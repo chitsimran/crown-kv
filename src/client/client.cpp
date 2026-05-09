@@ -676,17 +676,59 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
             completion_queue.Shutdown();
 
+            // Wait for CommitAcks, but bail out if no progress is made for a
+            // while. Without this, a single orphaned write (e.g. the original
+            // head was killed mid-flight before forwarding could happen)
+            // hangs the entire bench forever.
+            constexpr auto kStallTimeout = std::chrono::seconds(60);
+            constexpr auto kProgressTick = std::chrono::seconds(5);
+            uint64_t orphaned = 0;
+            auto last_progress = std::chrono::steady_clock::now();
+            uint64_t last_seen = 0;
             {
+                std::lock_guard<std::mutex> lg(state->mutex);
+                last_seen = state->completed;
+            }
+            while (true) {
                 std::unique_lock<std::mutex> lock(state->mutex);
-                state->cv.wait(lock, [&]() {
+                bool met = state->cv.wait_for(lock, kProgressTick, [&]() {
                     return state->completed >= start_completed + accepted;
                 });
+                uint64_t completed_now = state->completed;
+                lock.unlock();
+                if (met) {
+                    break;
+                }
+                auto now = std::chrono::steady_clock::now();
+                if (completed_now > last_seen) {
+                    last_seen = completed_now;
+                    last_progress = now;
+                }
+                auto stalled = now - last_progress;
+                uint64_t outstanding = (start_completed + accepted) - completed_now;
+                std::cout << "bench wait: completed="
+                          << (completed_now - start_completed)
+                          << "/" << accepted
+                          << " outstanding=" << outstanding
+                          << " stalled_for="
+                          << std::chrono::duration_cast<std::chrono::seconds>(stalled).count()
+                          << "s" << std::endl;
+                if (stalled >= kStallTimeout) {
+                    orphaned = outstanding;
+                    std::cout << "bench giving up: " << orphaned
+                              << " writes orphaned (no CommitAck after "
+                              << std::chrono::duration_cast<std::chrono::seconds>(kStallTimeout).count()
+                              << "s of no progress)" << std::endl;
+                    break;
+                }
             }
             auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
                 std::chrono::steady_clock::now() - bench_start);
-            std::cout << "committed " << accepted << " writes in " << elapsed.count()
-                      << "s (" << (accepted / elapsed.count()) << " ops/sec)"
+            uint64_t committed = accepted - orphaned;
+            std::cout << "committed " << committed << " writes in " << elapsed.count()
+                      << "s (" << (committed / elapsed.count()) << " ops/sec)"
                       << ", failed " << failed
+                      << ", orphaned " << orphaned
                       << ", async single-threaded" << std::endl;
         } else if (command == "pending") {
             PrintClientStats(state);

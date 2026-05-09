@@ -14,16 +14,10 @@
 #include <unordered_map>
 #include <vector>
 
-using replication::DrainAckRequest;
-using replication::DrainAckResponse;
-using replication::FreezeRequest;
-using replication::FreezeResponse;
 using replication::HeartbeatRequest;
 using replication::HeartbeatResponse;
 using replication::GetRequest;
 using replication::GetResponse;
-using replication::InflightRequest;
-using replication::InflightResponse;
 using replication::MembershipRequest;
 using replication::MembershipResponse;
 using replication::MetadataService;
@@ -50,8 +44,6 @@ constexpr int kRetryIntervalMs = 1000;
 enum class NodeState {
     STARTING,
     NORMAL,
-    FROZEN,
-    DRAINING_WAIT
 };
 
 struct ServerState {
@@ -60,10 +52,7 @@ struct ServerState {
     uint64_t epoch = 0;
     std::string mode;
     std::vector<NodeInfo> membership;
-    std::vector<NodeInfo> pending_membership;
     std::atomic<NodeState> state{NodeState::STARTING};
-    std::atomic<bool> drain_active{false};
-    uint64_t drain_epoch = 0;
 };
 
 // Verbose per-RPC logging is opt-in (--verbose). Default is silent — logging on
@@ -74,6 +63,39 @@ Replication* SelectReplicationForMode(const std::string& mode,
                                       ChainReplication* chain_replication,
                                       CraqReplication* craq_replication,
                                       CrownReplication* crown_replication);
+
+// Install a new membership/epoch on every replication mode. If `epoch_advanced`
+// is true (the local epoch actually moved forward), also re-forward any pending
+// entries through the new chain — this is the recovery path for writes that
+// were stuck behind a now-removed predecessor. We dedupe on epoch so concurrent
+// triggers (Reconfigure RPC + heartbeat-driven RefreshMembership) don't both
+// flood the queue with re-forwards.
+inline void ApplyMembership(const std::vector<NodeInfo>& membership,
+                            const std::string& node_id, const std::string& mode,
+                            uint64_t epoch, bool epoch_advanced,
+                            ChainReplication* chain, CraqReplication* craq,
+                            CrownReplication* crown) {
+    chain->update_membership(membership, node_id);
+    chain->set_epoch(epoch);
+    craq->update_membership(membership, node_id);
+    craq->set_epoch(epoch);
+    crown->update_membership(membership, node_id);
+    crown->set_epoch(epoch);
+    if (!epoch_advanced) {
+        return;
+    }
+    Replication* replication = SelectReplicationForMode(mode, chain, craq, crown);
+    if (!replication) {
+        return;
+    }
+    auto next_stub = replication->get_next_stub();
+    if (!next_stub) {
+        return;
+    }
+    for (const auto& pending : replication->snapshot_pending_requests()) {
+        replication->forward_put(pending, next_stub);
+    }
+}
 
 std::mutex log_mutex;
 
@@ -101,16 +123,6 @@ public:
         grpc::ClientContext context;
         grpc::Status status = stub_->GetMembership(&context, request, response);
         return status.ok();
-    }
-
-    bool SendDrainAck(const std::string& node_id, uint64_t epoch) {
-        DrainAckRequest request;
-        request.set_node_id(node_id);
-        request.set_epoch(epoch);
-        DrainAckResponse response;
-        grpc::ClientContext context;
-        grpc::Status status = stub_->ReportDrainAck(&context, request, &response);
-        return status.ok() && response.success();
     }
 
     bool SendHeartbeat(const std::string& node_id, uint64_t epoch, uint64_t* out_epoch) {
@@ -153,69 +165,39 @@ public:
                     craq_replication_(craq_replication),
                     crown_replication_(crown_replication) {}
 
-    grpc::Status Freeze(grpc::ServerContext*, const FreezeRequest* request,
-                        FreezeResponse* response) override {
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            if (request->epoch() < state_->epoch) {
-                response->set_success(false);
-                response->set_node_id(state_->node_id);
-                return grpc::Status::OK;
-            }
-            state_->epoch = request->epoch();
-            state_->pending_membership.assign(request->v_new().begin(), request->v_new().end());
-            state_->state.store(NodeState::FROZEN);
-            state_->drain_epoch = request->epoch();
-        }
-        StartDrain(request->epoch());
-        response->set_success(true);
-        response->set_node_id(state_->node_id);
-        return grpc::Status::OK;
-    }
-
     grpc::Status Reconfigure(grpc::ServerContext*, const ReconfigureRequest* request,
                              ReconfigureResponse* response) override {
+        bool epoch_advanced = false;
         std::vector<NodeInfo> membership_copy;
         std::string node_id;
+        std::string mode;
         bool needs_sync = false;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            // Drop stale-epoch reconfigurations. A delayed/duplicate Reconfigure
-            // RPC must never clobber state derived from a newer epoch.
+            // Drop stale-epoch reconfigurations.
             if (request->epoch() < state_->epoch) {
                 response->set_success(false);
                 response->set_node_id(state_->node_id);
                 return grpc::Status::OK;
             }
+            epoch_advanced = request->epoch() > state_->epoch;
             state_->epoch = request->epoch();
             state_->mode = request->mode();
-            state_->membership.assign(request->membership().begin(), request->membership().end());
-            state_->pending_membership.clear();
+            state_->membership.assign(request->membership().begin(),
+                                      request->membership().end());
             needs_sync = !request->added_node_id().empty() &&
                          request->added_node_id() == state_->node_id;
             membership_copy = state_->membership;
             node_id = state_->node_id;
+            mode = state_->mode;
         }
         if (needs_sync) {
             SyncFromPeer(membership_copy, node_id, request->epoch());
             metadata_client_->SendSyncComplete(node_id, request->epoch());
         }
-        chain_replication_->update_membership(membership_copy, node_id);
-        chain_replication_->set_epoch(request->epoch());
-        craq_replication_->update_membership(membership_copy, node_id);
-        craq_replication_->set_epoch(request->epoch());
-        crown_replication_->update_membership(membership_copy, node_id);
-        crown_replication_->set_epoch(request->epoch());
-        Replication* replication = SelectReplicationForMode(
-            request->mode(), chain_replication_, craq_replication_, crown_replication_);
-        if (replication) {
-            auto next_stub = replication->get_next_stub();
-            if (next_stub) {
-                for (const auto& pending : replication->snapshot_pending_requests()) {
-                    replication->forward_put(pending, next_stub);
-                }
-            }
-        }
+        ApplyMembership(membership_copy, node_id, mode, request->epoch(),
+                        epoch_advanced, chain_replication_, craq_replication_,
+                        crown_replication_);
         state_->state.store(NodeState::NORMAL);
         response->set_success(true);
         response->set_node_id(state_->node_id);
@@ -223,17 +205,6 @@ public:
     }
 
 private:
-    void StartDrain(uint64_t epoch) {
-        bool already_active = state_->drain_active.exchange(true);
-        if (already_active) {
-            return;
-        }
-        InflightRequest inflight;
-        inflight.set_origin_node_id(state_->node_id);
-        inflight.set_epoch(epoch);
-        SendOriginInflight(inflight);
-    }
-
     void SyncFromPeer(const std::vector<NodeInfo>& membership,
                       const std::string& node_id, uint64_t epoch) {
         for (const auto& member : membership) {
@@ -263,71 +234,6 @@ private:
             KVStore::apply_committed_snapshot(values, versions);
             return;
         }
-    }
-
-    void SendOriginInflight(const InflightRequest& inflight) {
-        std::string mode;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            mode = state_->mode;
-        }
-
-        Replication* replication = SelectReplicationForMode(
-            mode, chain_replication_, craq_replication_, crown_replication_);
-        if (!replication) {
-            state_->drain_active.store(false);
-            return;
-        }
-
-        auto next_stub = DrainSuccessorStub(replication);
-        if (next_stub) {
-            while (replication->pending_count() > 0) {
-                auto pending = replication->snapshot_pending_requests();
-                for (const auto& request : pending) {
-                    replication->forward_put(request, next_stub);
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-            InflightResponse response;
-            grpc::ClientContext context;
-            next_stub->ForwardInflight(&context, inflight, &response);
-        } else {
-            state_->state.store(NodeState::DRAINING_WAIT);
-            metadata_client_->SendDrainAck(state_->node_id, inflight.epoch());
-        }
-
-        state_->drain_active.store(false);
-    }
-
-    std::shared_ptr<ReplicationService::Stub> DrainSuccessorStub(Replication* replication) {
-        std::vector<NodeInfo> pending_membership;
-        std::vector<NodeInfo> current_membership;
-        std::string node_id;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            pending_membership = state_->pending_membership;
-            current_membership = state_->membership;
-            node_id = state_->node_id;
-        }
-
-        bool removal = !pending_membership.empty() &&
-                       pending_membership.size() < current_membership.size();
-        if (!removal) {
-            return replication->get_next_stub();
-        }
-
-        int ring_size = static_cast<int>(pending_membership.size());
-        if (ring_size <= 1) {
-            return nullptr;
-        }
-        for (int i = 0; i < ring_size; ++i) {
-            if (pending_membership[i].node_id() == node_id) {
-                return replication_common::make_replication_stub(
-                    pending_membership[(i + 1) % ring_size]);
-            }
-        }
-        return replication->get_next_stub();
     }
 
     ServerState* state_;
@@ -523,23 +429,6 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status ForwardInflight(grpc::ServerContext*, const InflightRequest* request,
-                                 InflightResponse* response) override {
-        response->set_success(true);
-        std::string mode;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            mode = state_->mode;
-        }
-        Replication* replication = SelectReplication(mode);
-        if (!replication) {
-            return grpc::Status::OK;
-        }
-
-        HandleInflight(replication, *request);
-        return grpc::Status::OK;
-    }
-
     grpc::Status VersionQuery(grpc::ServerContext*, const VersionQueryRequest* request,
                               VersionQueryResponse* response) override {
         uint64_t local_epoch = 0;
@@ -608,61 +497,10 @@ private:
         return nullptr;
     }
 
-    void HandleInflight(Replication* replication, const InflightRequest& inflight) {
-        auto next_stub = DrainSuccessorStub(replication);
-        if (next_stub) {
-            while (replication->pending_count() > 0) {
-                auto pending = replication->snapshot_pending_requests();
-                for (const auto& request : pending) {
-                    replication->forward_put(request, next_stub);
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-
-        if (inflight.origin_node_id() == state_->node_id) {
-            state_->state.store(NodeState::DRAINING_WAIT);
-            metadata_client_->SendDrainAck(state_->node_id, inflight.epoch());
-            return;
-        }
-
-        if (next_stub) {
-            InflightResponse response;
-            grpc::ClientContext context;
-            next_stub->ForwardInflight(&context, inflight, &response);
-        }
-    }
-
-    std::shared_ptr<ReplicationService::Stub> DrainSuccessorStub(Replication* replication) {
-        std::vector<NodeInfo> pending_membership;
-        std::vector<NodeInfo> current_membership;
-        std::string node_id;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            pending_membership = state_->pending_membership;
-            current_membership = state_->membership;
-            node_id = state_->node_id;
-        }
-
-        bool removal = !pending_membership.empty() &&
-                       pending_membership.size() < current_membership.size();
-        if (!removal) {
-            return replication->get_next_stub();
-        }
-
-        int ring_size = static_cast<int>(pending_membership.size());
-        if (ring_size <= 1) {
-            return nullptr;
-        }
-        for (int i = 0; i < ring_size; ++i) {
-            if (pending_membership[i].node_id() == node_id) {
-                return replication_common::make_replication_stub(
-                    pending_membership[(i + 1) % ring_size]);
-            }
-        }
-        return replication->get_next_stub();
-    }
-
+    // Pull membership from the metadata store. Used as a fallback when an RPC
+    // arrives carrying an epoch newer than ours — typically that means we
+    // missed (or are about to receive) a Reconfigure. We re-forward pending
+    // entries here too so a lost Reconfigure RPC doesn't leave writes stuck.
     void RefreshMembershipAsync() {
         MembershipResponse membership_response;
         if (!metadata_client_->GetMembership(&membership_response)) {
@@ -670,24 +508,26 @@ private:
         }
         std::vector<NodeInfo> membership_copy;
         std::string node_id;
+        std::string mode;
+        bool epoch_advanced = false;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            if (membership_response.epoch() < state_->epoch) {
+            if (membership_response.epoch() <= state_->epoch) {
                 return;
             }
+            epoch_advanced = true;
             state_->epoch = membership_response.epoch();
             state_->mode = membership_response.mode();
             state_->membership.assign(membership_response.membership().begin(),
                                       membership_response.membership().end());
             membership_copy = state_->membership;
             node_id = state_->node_id;
+            mode = state_->mode;
         }
-        chain_replication_->update_membership(membership_copy, node_id);
-        chain_replication_->set_epoch(membership_response.epoch());
-        craq_replication_->update_membership(membership_copy, node_id);
-        craq_replication_->set_epoch(membership_response.epoch());
-        crown_replication_->update_membership(membership_copy, node_id);
-        crown_replication_->set_epoch(membership_response.epoch());
+        ApplyMembership(membership_copy, node_id, mode,
+                        membership_response.epoch(), epoch_advanced,
+                        chain_replication_, craq_replication_,
+                        crown_replication_);
     }
 
     ServerState* state_;
@@ -723,8 +563,14 @@ void RefreshMembership(ServerState* state, MetadataClient* client,
     }
     std::vector<NodeInfo> membership_copy;
     std::string node_id;
+    std::string mode;
+    bool epoch_advanced = false;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
+        if (response.epoch() < state->epoch) {
+            return;
+        }
+        epoch_advanced = response.epoch() > state->epoch;
         state->epoch = response.epoch();
         state->mode = response.mode();
         state->membership.assign(response.membership().begin(), response.membership().end());
@@ -733,13 +579,11 @@ void RefreshMembership(ServerState* state, MetadataClient* client,
         }
         membership_copy = state->membership;
         node_id = state->node_id;
+        mode = state->mode;
     }
-    chain_replication->update_membership(membership_copy, node_id);
-    chain_replication->set_epoch(response.epoch());
-    craq_replication->update_membership(membership_copy, node_id);
-    craq_replication->set_epoch(response.epoch());
-    crown_replication->update_membership(membership_copy, node_id);
-    crown_replication->set_epoch(response.epoch());
+    ApplyMembership(membership_copy, node_id, mode, response.epoch(),
+                    epoch_advanced, chain_replication, craq_replication,
+                    crown_replication);
 }
 
 void HeartbeatLoop(ServerState* state, MetadataClient* client,

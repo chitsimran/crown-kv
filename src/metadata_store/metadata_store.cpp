@@ -3,20 +3,14 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-using replication::DrainAckRequest;
-using replication::DrainAckResponse;
-using replication::FreezeRequest;
-using replication::FreezeResponse;
 using replication::HeartbeatRequest;
 using replication::HeartbeatResponse;
 using replication::MembershipRequest;
@@ -32,13 +26,12 @@ using replication::SyncCompleteResponse;
 
 namespace {
 
-// Servers send heartbeats every 500ms (server.cpp::kHeartbeatIntervalMs). Match
-// that here so the threshold math reflects reality. 60 misses -> 30 s of silence
-// before a node is declared dead — long enough to ride out benchmark-induced
-// stalls, short enough to recover from real failures within a reasonable window.
-constexpr int kHeartbeatIntervalMs = 500;
-constexpr int kHeartbeatMissThreshold = 60; // 30 seconds
-constexpr int kFreezeAckTimeoutMs = 2000;
+// Servers send heartbeats every 400ms (server.cpp::kHeartbeatIntervalMs). Match
+// that here so the threshold math reflects reality. 10 misses -> 4 s of silence
+// before a node is declared dead — short enough that the bench-with-kill scenario
+// recovers in a reasonable time, long enough to ride out brief stalls.
+constexpr int kHeartbeatIntervalMs = 400;
+constexpr int kHeartbeatMissThreshold = 10; // 4 seconds
 
 struct ClusterState {
     std::mutex mutex;
@@ -46,10 +39,6 @@ struct ClusterState {
     std::string mode = "CHAIN";
     std::vector<NodeInfo> membership;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_heartbeat;
-    std::unordered_set<std::string> drain_acks;
-    uint64_t drain_epoch = 0;
-    size_t expected_drain_acks = 0;
-    std::condition_variable drain_cv;
     std::atomic<bool> reconfig_in_progress{false};
 };
 
@@ -156,20 +145,6 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status ReportDrainAck(grpc::ServerContext*, const DrainAckRequest* request,
-                                DrainAckResponse* response) override {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        if (request->epoch() == state_->drain_epoch) {
-            state_->drain_acks.insert(request->node_id());
-            if (state_->expected_drain_acks > 0 &&
-                state_->drain_acks.size() >= state_->expected_drain_acks) {
-                state_->drain_cv.notify_all();
-            }
-        }
-        response->set_success(true);
-        return grpc::Status::OK;
-    }
-
     grpc::Status ReportSyncDone(grpc::ServerContext*, const SyncCompleteRequest*,
                                 SyncCompleteResponse* response) override {
         response->set_success(true);
@@ -179,24 +154,6 @@ public:
 private:
     ClusterState* state_;
 };
-
-bool SendFreeze(const NodeInfo& node, uint64_t epoch,
-                const std::vector<NodeInfo>& new_membership) {
-    auto channel = grpc::CreateChannel(ToAddress(node), grpc::InsecureChannelCredentials());
-    auto stub = MetadataService::NewStub(channel);
-    FreezeRequest request;
-    request.set_epoch(epoch);
-    for (const auto& member : new_membership) {
-        *request.add_v_new() = member;
-    }
-    FreezeResponse response;
-    grpc::ClientContext context;
-    auto deadline = std::chrono::system_clock::now() +
-                    std::chrono::milliseconds(kFreezeAckTimeoutMs);
-    context.set_deadline(deadline);
-    grpc::Status status = stub->Freeze(&context, request, &response);
-    return status.ok() && response.success();
-}
 
 bool SendReconfigure(const NodeInfo& node, uint64_t epoch,
                      const std::vector<NodeInfo>& membership, const std::string& mode,
@@ -214,14 +171,18 @@ bool SendReconfigure(const NodeInfo& node, uint64_t epoch,
     }
     ReconfigureResponse response;
     grpc::ClientContext context;
+    // Bound the call so a slow/stuck node doesn't block the rollout to other
+    // survivors. The handler is lightweight (mostly metadata + enqueueing
+    // pending re-forwards), so 5 s is generous.
+    context.set_deadline(std::chrono::system_clock::now() +
+                         std::chrono::milliseconds(5000));
     grpc::Status status = stub->Reconfigure(&context, request, &response);
     return status.ok() && response.success();
 }
 
 void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_node_id) {
-    std::vector<NodeInfo> old_membership;
     std::vector<NodeInfo> new_membership;
-    uint64_t old_epoch = 0;
+    uint64_t new_epoch = 0;
     std::string mode;
 
     {
@@ -231,9 +192,6 @@ void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_nod
                       << " failed=" << failed_node_id << std::endl;
             return;
         }
-        old_epoch = state->epoch;
-        mode = state->mode;
-        old_membership = state->membership;
         bool found_failed_node = false;
         for (const auto& member : state->membership) {
             if (member.node_id() != failed_node_id) {
@@ -248,69 +206,34 @@ void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_nod
                       << " failed=" << failed_node_id << std::endl;
             return;
         }
-        state->drain_epoch = old_epoch;
-        state->expected_drain_acks = new_membership.size();
-        state->drain_acks.clear();
+        state->epoch += 1;
+        new_epoch = state->epoch;
+        state->membership = new_membership;
+        state->last_heartbeat.erase(failed_node_id);
+        mode = state->mode;
+        state->reconfig_in_progress.store(false);
     }
     std::cerr << "[metadata] TriggerReconfigureRemove start"
               << " failed=" << failed_node_id
-              << " old_epoch=" << old_epoch
-              << " new_epoch=" << (old_epoch + 1)
+              << " new_epoch=" << new_epoch
               << " survivors=" << new_membership.size() << std::endl;
 
-    std::vector<NodeInfo> freeze_confirmed_membership;
-    for (const auto& node : old_membership) {
-        if (node.node_id() == failed_node_id) {
-            continue;
-        }
-        if (SendFreeze(node, old_epoch, new_membership)) {
-            for (const auto& candidate : new_membership) {
-                if (candidate.node_id() == node.node_id()) {
-                    freeze_confirmed_membership.push_back(candidate);
-                    break;
-                }
-            }
-        }
-    }
-
-    if (freeze_confirmed_membership.empty()) {
-        freeze_confirmed_membership = new_membership;
-    }
-
-    {
-        std::unique_lock<std::mutex> lock(state->mutex);
-        state->expected_drain_acks = freeze_confirmed_membership.size();
-        if (state->expected_drain_acks > 0) {
-            state->drain_cv.wait_for(
-                lock, std::chrono::milliseconds(kFreezeAckTimeoutMs), [&]() {
-                    return state->drain_acks.size() >= state->expected_drain_acks;
-                });
-        }
-        state->epoch = old_epoch + 1;
-        state->membership = freeze_confirmed_membership;
-        state->last_heartbeat.erase(failed_node_id);
-        std::unordered_set<std::string> live_ids;
-        for (const auto& member : state->membership) {
-            live_ids.insert(member.node_id());
-        }
-        for (const auto& member : old_membership) {
-            if (live_ids.count(member.node_id()) == 0) {
-                state->last_heartbeat.erase(member.node_id());
-            }
-        }
-        state->reconfig_in_progress.store(false);
-        new_membership = state->membership;
-    }
-
+    // Survivors learn about the new ring via this single Reconfigure pass.
+    // Each handler installs the new membership/epoch and re-forwards its
+    // pending entries through the new chain. A node that misses this RPC
+    // catches up via heartbeat-driven RefreshMembership in server.cpp.
     for (const auto& node : new_membership) {
-        SendReconfigure(node, old_epoch + 1, new_membership, mode, failed_node_id);
+        if (!SendReconfigure(node, new_epoch, new_membership, mode, failed_node_id)) {
+            std::cerr << "[metadata] SendReconfigure failed node=" << node.node_id()
+                      << " epoch=" << new_epoch
+                      << " (will recover via heartbeat refresh)" << std::endl;
+        }
     }
 }
 
 void TriggerReconfigureAdd(ClusterState* state, const NodeInfo& added_node) {
-    std::vector<NodeInfo> old_membership;
     std::vector<NodeInfo> new_membership;
-    uint64_t old_epoch = 0;
+    uint64_t new_epoch = 0;
     std::string mode;
 
     {
@@ -318,9 +241,6 @@ void TriggerReconfigureAdd(ClusterState* state, const NodeInfo& added_node) {
         if (state->reconfig_in_progress.exchange(true)) {
             return;
         }
-        old_epoch = state->epoch;
-        mode = state->mode;
-        old_membership = state->membership;
         new_membership = state->membership;
         for (const auto& member : new_membership) {
             if (member.node_id() == added_node.node_id()) {
@@ -329,31 +249,16 @@ void TriggerReconfigureAdd(ClusterState* state, const NodeInfo& added_node) {
             }
         }
         new_membership.push_back(added_node);
-        state->drain_epoch = old_epoch;
-        state->expected_drain_acks = old_membership.size();
-        state->drain_acks.clear();
-    }
-
-    for (const auto& node : old_membership) {
-        SendFreeze(node, old_epoch, new_membership);
-    }
-
-    {
-        std::unique_lock<std::mutex> lock(state->mutex);
-        if (state->expected_drain_acks > 0) {
-            state->drain_cv.wait_for(
-                lock, std::chrono::milliseconds(kFreezeAckTimeoutMs), [&]() {
-                    return state->drain_acks.size() >= state->expected_drain_acks;
-                });
-        }
-        state->epoch = old_epoch + 1;
+        state->epoch += 1;
+        new_epoch = state->epoch;
         state->membership = new_membership;
         state->last_heartbeat[added_node.node_id()] = std::chrono::steady_clock::now();
+        mode = state->mode;
         state->reconfig_in_progress.store(false);
     }
 
     for (const auto& node : new_membership) {
-        SendReconfigure(node, old_epoch + 1, new_membership, mode, "",
+        SendReconfigure(node, new_epoch, new_membership, mode, "",
                         added_node.node_id());
     }
 }

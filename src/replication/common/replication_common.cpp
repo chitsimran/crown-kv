@@ -19,20 +19,22 @@ using replication::WriteAckResponse;
 
 namespace {
 
-// Pending-ack retry deadline. Deliberately very conservative: retries should fire
-// only when a write is truly stuck (e.g., the chain dropped a WriteAck during a
-// reconfiguration). The head waits for an ack to traverse the entire ring, so the
-// deadline must accommodate the slowest position; we use one value for all nodes.
-constexpr auto kAckTimeout = std::chrono::milliseconds(300000); // 5 minutes
-// gRPC deadline for individual ForwardPut RPCs. Wide enough that benchmark-induced
-// slowness on the next node never trips DEADLINE_EXCEEDED.
-constexpr auto kForwardRpcDeadline = std::chrono::milliseconds(60000); // 1 minute
+// Pending-ack retry deadline. Short enough that a stuck forward retries quickly,
+// long enough that a healthy chain isn't spammed unnecessarily.
+constexpr auto kAckTimeout = std::chrono::milliseconds(10000); // 10 seconds
+// gRPC deadline for individual ForwardPut RPCs. Tight enough that a forward to a
+// dead node fails fast (instead of holding a worker for a full minute), but wide
+// enough to absorb benchmark-induced slowness on a healthy successor.
+constexpr auto kForwardRpcDeadline = std::chrono::milliseconds(10000); // 10 seconds
 // gRPC deadline for fire-and-forget ack RPCs (WriteAck/CommitAck). Long enough to
 // survive transient stalls but short enough that slow consumers don't bloat the CQ.
-constexpr auto kAckRpcDeadline = std::chrono::milliseconds(60000);
+constexpr auto kAckRpcDeadline = std::chrono::milliseconds(10000);
 constexpr size_t kForwardWorkerCount = 16;
 constexpr size_t kMaxForwardQueueSize = 100000;
-constexpr int kMaxRetryCount = 20;
+// After this many retries to a stuck successor, stop retrying. The entry stays
+// in pending_acks; a subsequent Reconfigure (driven by the metadata store on
+// failure detection) re-forwards through the new topology.
+constexpr int kMaxRetryCount = 3;
 
 std::atomic<bool> g_log_verbose{false};
 
@@ -288,32 +290,24 @@ std::vector<PutRequest> Replication::snapshot_pending_requests() {
 
 std::vector<PutRequest> Replication::collect_expired_requests() {
     std::vector<PutRequest> expired;
-    std::vector<int64_t> dropped_ids;
     auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        for (auto it = pending_acks.begin(); it != pending_acks.end(); ) {
-            if (it->second.deadline > now) {
-                ++it;
+        for (auto& kv : pending_acks) {
+            auto& entry = kv.second;
+            if (entry.deadline > now) {
                 continue;
             }
-            if (it->second.retry_count >= kMaxRetryCount) {
-                dropped_ids.push_back(it->first);
-                it = pending_acks.erase(it);
+            // Cap retries. Beyond the limit we leave the entry untouched in the
+            // map; Reconfigure will re-forward it through the new chain when
+            // the metadata store detects the failure.
+            if (entry.retry_count >= kMaxRetryCount) {
                 continue;
             }
-            it->second.retry_count += 1;
-            it->second.deadline = now + kAckTimeout;
-            expired.push_back(it->second.request);
-            ++it;
+            entry.retry_count += 1;
+            entry.deadline = now + kAckTimeout;
+            expired.push_back(entry.request);
         }
-    }
-    if (!dropped_ids.empty()) {
-        std::ostringstream out;
-        out << "drop_orphan_pending count=" << dropped_ids.size()
-            << " max_retries=" << kMaxRetryCount
-            << " first_request_id=" << dropped_ids.front();
-        LogReplicationEvent(out.str());
     }
     if (!expired.empty()) {
         std::ostringstream out;

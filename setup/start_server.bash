@@ -150,7 +150,7 @@ start_server() {
     : > "$out_file"
 
     local server_cmd
-    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR}' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}' 2>&1"
+    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR} --verbose' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}' --verbose 2>&1"
     echo "Run command: $server_cmd"
     {
         echo "[launch] $(date -Is)"
