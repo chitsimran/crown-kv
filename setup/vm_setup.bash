@@ -3,15 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
-HOSTS_FILE="$SCRIPT_DIR/prod_hosts.csv"
+RING_HOSTS_FILE="$SCRIPT_DIR/prod_hosts.csv"
+CLIENT_HOSTS_FILE="$SCRIPT_DIR/client_hosts.csv"
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "Error: .env not found at $ENV_FILE"
     echo "Copy setup/.env.example to setup/.env and fill it in."
     exit 1
 fi
-if [[ ! -f "$HOSTS_FILE" ]]; then
-    echo "Error: host file not found at $HOSTS_FILE"
+if [[ ! -f "$RING_HOSTS_FILE" ]]; then
+    echo "Error: ring hosts file not found at $RING_HOSTS_FILE"
     exit 1
 fi
 
@@ -29,6 +30,7 @@ PROJECT_SUBDIR="${PROJECT_SUBDIR:-.}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 PROTOCOL_MODE="${PROTOCOL_MODE:-CROWN}"
 METADATA_PORT="${METADATA_PORT:-50050}"
+METADATA_HOST="${METADATA_HOST:?Missing METADATA_HOST in .env}"
 NODE_BIND_HOST="${NODE_BIND_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-50051}"
 CLIENT_ACK_PORT="${CLIENT_ACK_PORT:-6000}"
@@ -36,45 +38,31 @@ TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 RUN_SCOPE="${RUN_SCOPE:-shared}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
+METADATA_ADDR="${METADATA_HOST}:${METADATA_PORT}"
+
 SSH_OPTS=(-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 if [[ -n "${SSH_KEY_LOCAL:-}" && -f "${SSH_KEY_LOCAL:-/dev/null}" ]]; then
     SSH_OPTS=(-i "$SSH_KEY_LOCAL" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 fi
 
-read_hosts() {
-    tr ',\n' '\n\n' < "$HOSTS_FILE" |
+read_hosts_file() {
+    local file="$1"
+    tr ',\n' '\n\n' < "$file" |
         sed 's/#.*$//' |
         sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
         awk 'NF > 0'
 }
 
-mapfile -t HOSTS < <(read_hosts)
-if [[ "${#HOSTS[@]}" -eq 0 ]]; then
-    echo "Error: no hosts found in $HOSTS_FILE"
-    exit 1
-fi
-
-METADATA_HOST="${METADATA_HOST:-${HOSTS[0]}}"
-METADATA_ADDR="${METADATA_HOST}:${METADATA_PORT}"
-
-DATA_HOSTS=()
-for host in "${HOSTS[@]}"; do
-    if [[ "$host" != "$METADATA_HOST" ]]; then
-        DATA_HOSTS+=("$host")
-    fi
-done
+mapfile -t DATA_HOSTS < <(read_hosts_file "$RING_HOSTS_FILE")
 if [[ "${#DATA_HOSTS[@]}" -eq 0 ]]; then
-    echo "Error: no data hosts remain after excluding metadata host: $METADATA_HOST"
-    echo "Add at least one non-metadata host to $HOSTS_FILE."
+    echo "Error: no ring hosts found in $RING_HOSTS_FILE"
     exit 1
 fi
 
-ALL_SETUP_HOSTS=("$METADATA_HOST")
-for host in "${DATA_HOSTS[@]}"; do
-    if [[ "$host" != "$METADATA_HOST" ]]; then
-        ALL_SETUP_HOSTS+=("$host")
-    fi
-done
+CLIENT_HOSTS=()
+if [[ -f "$CLIENT_HOSTS_FILE" ]]; then
+    mapfile -t CLIENT_HOSTS < <(read_hosts_file "$CLIENT_HOSTS_FILE")
+fi
 
 build_members_arg() {
     local members=()
@@ -88,7 +76,18 @@ build_members_arg() {
 
 MEMBERS_ARG="$(build_members_arg)"
 
+# Collect all unique hosts that need setup/build across all roles.
+declare -A _seen_hosts
+ALL_BUILD_HOSTS=()
+for _h in "$METADATA_HOST" "${DATA_HOSTS[@]}" "${CLIENT_HOSTS[@]}"; do
+    if [[ -z "${_seen_hosts[$_h]+x}" ]]; then
+        _seen_hosts[$_h]=1
+        ALL_BUILD_HOSTS+=("$_h")
+    fi
+done
+
 usage() {
+    local client_hosts_display="${CLIENT_HOSTS[*]:-none}"
     cat <<EOF
 Usage: $0 <setup|start|rerun|kill|repl-info> [--skip-build]
 
@@ -96,11 +95,13 @@ Options:
   --skip-build, -n   Skip git pull and build on the VMs; reuse the existing binary.
                      Equivalent to setting SKIP_BUILD=1 in the environment.
 
-Hosts:         $HOSTS_FILE
-Metadata host: $METADATA_HOST
-Metadata addr: $METADATA_ADDR
-Data hosts:    ${DATA_HOSTS[*]}
-Members:       $MEMBERS_ARG
+Ring hosts file:   $RING_HOSTS_FILE
+Client hosts file: $CLIENT_HOSTS_FILE (optional)
+Metadata host:     $METADATA_HOST
+Metadata addr:     $METADATA_ADDR
+Ring nodes:        ${DATA_HOSTS[*]}
+Client nodes:      $client_hosts_display
+Members:           $MEMBERS_ARG
 EOF
 }
 
@@ -154,15 +155,27 @@ export SKIP_BUILD
 
 case "$action" in
     setup)
-        for host in "${ALL_SETUP_HOSTS[@]}"; do
+        # Install system packages on every host that will run any part of the system.
+        for host in "${ALL_BUILD_HOSTS[@]}"; do
             copy_and_run "$host" "$SCRIPT_DIR/setup.bash"
         done
         ;;
     start|build|deploy)
+        # 1. Metadata store (also builds all binaries on that host).
         copy_and_run "$METADATA_HOST" "$SCRIPT_DIR/start_metadata.bash"
         sleep 1
+        # 2. Ring server nodes.
         for host in "${DATA_HOSTS[@]}"; do
             copy_and_run "$host" "$SCRIPT_DIR/start_server.bash" "NODE_ID=$(printf '%q' "$host")"
+        done
+        # 3. Client-only nodes: clone + build, no process started.
+        #    Skip hosts that are also the metadata host (already built above).
+        for host in "${CLIENT_HOSTS[@]}"; do
+            if [[ "$host" == "$METADATA_HOST" ]]; then
+                echo "==> $host (client role: already built as metadata host, skipping duplicate build)"
+                continue
+            fi
+            copy_and_run "$host" "$SCRIPT_DIR/build_only.bash"
         done
         ;;
     rerun)
@@ -170,25 +183,35 @@ case "$action" in
         "$0" start
         ;;
     kill)
-        for host in "${ALL_SETUP_HOSTS[@]}"; do
-            copy_and_run "$host" "$SCRIPT_DIR/kill.bash"
+        # Kill metadata and ring nodes. Client nodes have no persistent process.
+        declare -A _kill_seen
+        for host in "$METADATA_HOST" "${DATA_HOSTS[@]}"; do
+            if [[ -z "${_kill_seen[$host]+x}" ]]; then
+                _kill_seen[$host]=1
+                copy_and_run "$host" "$SCRIPT_DIR/kill.bash"
+            fi
         done
         ;;
     repl-info)
+        local_client_list=""
+        for host in "${CLIENT_HOSTS[@]}"; do
+            local_client_list+="  build/client --metadata $METADATA_ADDR --listen ${host}:${CLIENT_ACK_PORT} --repl"$'\n'
+        done
+        if [[ -z "$local_client_list" ]]; then
+            local_client_list="  (no client_hosts.csv — replace <host> with a reachable hostname)"$'\n'
+            local_client_list+="  build/client --metadata $METADATA_ADDR --listen <host>:${CLIENT_ACK_PORT} --repl"$'\n'
+        fi
         cat <<EOF
 Metadata address:
   $METADATA_ADDR
 
-Run the REPL from a machine reachable by the servers for CommitAck callbacks.
-Replace <reachable-client-host> with that machine's hostname or IP:
+Ring nodes:
+  ${DATA_HOSTS[*]}
 
-  build/client --metadata $METADATA_ADDR --listen <reachable-client-host>:$CLIENT_ACK_PORT --repl
-
+Client commands (SSH into each host, then run):
+$local_client_list
 Current members:
   $MEMBERS_ARG
-
-Data hosts:
-  ${DATA_HOSTS[*]}
 EOF
         ;;
     ""|-h|--help|help)
