@@ -23,6 +23,8 @@ using replication::SetModeRequest;
 using replication::SetModeResponse;
 using replication::SyncCompleteRequest;
 using replication::SyncCompleteResponse;
+using replication::AddMemberRequest;
+using replication::AddMemberResponse;
 
 namespace {
 
@@ -132,6 +134,22 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             response->set_epoch(state_->epoch + 1);
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status AddMember(grpc::ServerContext*, const AddMemberRequest* request,
+                           AddMemberResponse* response) override {
+        NodeInfo new_node;
+        new_node.set_node_id(request->node_id());
+        new_node.set_address(request->address());
+        new_node.set_port(request->port());
+
+        std::thread(TriggerReconfigureAdd, state_, new_node).detach();
+        response->set_success(true);
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            response->set_new_epoch(state_->epoch + 1);
         }
         return grpc::Status::OK;
     }

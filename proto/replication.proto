@@ -151,6 +151,18 @@ message SetModeResponse {
     uint64 epoch = 3;
 }
 
+message AddMemberRequest {
+    string node_id = 1;
+    string address = 2;
+    int32 port = 3;
+}
+
+message AddMemberResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 new_epoch = 3;
+}
+
 service ReplicationService {
     rpc Put (PutRequest) returns (PutResponse);
     rpc Get (GetRequest) returns (GetResponse);
@@ -169,6 +181,7 @@ service ClientAckService {
 service MetadataService {
     rpc GetMembership (MembershipRequest) returns (MembershipResponse);
     rpc SetMode (SetModeRequest) returns (SetModeResponse);
+    rpc AddMember (AddMemberRequest) returns (AddMemberResponse);
     rpc Freeze (FreezeRequest) returns (FreezeResponse);
     rpc Reconfigure (ReconfigureRequest) returns (ReconfigureResponse);
     rpc ReportDrainAck (DrainAckRequest) returns (DrainAckResponse);

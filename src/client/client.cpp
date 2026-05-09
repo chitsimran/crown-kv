@@ -36,6 +36,8 @@ using replication::PutResponse;
 using replication::ReplicationService;
 using replication::SetModeRequest;
 using replication::SetModeResponse;
+using replication::AddMemberRequest;
+using replication::AddMemberResponse;
 
 namespace {
 
@@ -320,6 +322,7 @@ void PrintHelp() {
         << "  members                    Show epoch, mode, and nodes\n"
         << "  mode                       Show current mode\n"
         << "  use CHAIN|CRAQ|CROWN       Change cluster mode via metadata_store\n"
+        << "  add-member NODE_ID ADDR PORT   Add a new node to the ring (starts reconfiguration)\n"
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
@@ -362,6 +365,42 @@ bool SetClusterMode(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    return FetchMembership(metadata_stub, membership);
+}
+
+bool AddMemberToCluster(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
+                        const std::string& node_id, const std::string& address, int port,
+                        MembershipState* membership) {
+    AddMemberRequest request;
+    request.set_node_id(node_id);
+    request.set_address(address);
+    request.set_port(port);
+    AddMemberResponse response;
+    grpc::ClientContext context;
+    grpc::Status status = metadata_stub->AddMember(&context, request, &response);
+    if (!status.ok()) {
+        std::cout << "add-member failed: " << status.error_message() << std::endl;
+        return false;
+    }
+    if (!response.success()) {
+        std::cout << "add-member error: " << response.error() << std::endl;
+        return false;
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        if (!FetchMembership(metadata_stub, membership)) {
+            return false;
+        }
+        for (const auto& member : membership->members) {
+            if (member.node_id() == node_id) {
+                std::cout << "new member " << node_id << " joined (epoch " << membership->epoch << ")"
+                          << std::endl;
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::cout << "member join did not complete in time, but request was sent" << std::endl;
     return FetchMembership(metadata_stub, membership);
 }
 
@@ -718,6 +757,24 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             if (SetClusterMode(metadata_stub, words[1], membership)) {
                 std::cout << "mode is now " << membership->mode << " at epoch "
                           << membership->epoch << std::endl;
+            }
+        } else if (command == "add-member") {
+            if (words.size() != 4) {
+                std::cout << "usage: add-member NODE_ID ADDRESS PORT" << std::endl;
+                std::cout << "example: add-member node3 sp26-cs525-1216.cs.illinois.edu 50051"
+                          << std::endl;
+                continue;
+            }
+            int port = 0;
+            try {
+                port = std::stoi(words[3]);
+            } catch (...) {
+                std::cout << "invalid port number" << std::endl;
+                continue;
+            }
+            if (AddMemberToCluster(metadata_stub, words[1], words[2], port, membership)) {
+                std::cout << "cluster now has " << membership->members.size() << " members"
+                          << std::endl;
             }
         } else if (command == "get") {
             if (words.size() != 2) {
