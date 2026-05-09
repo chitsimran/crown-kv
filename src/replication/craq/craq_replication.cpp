@@ -106,8 +106,8 @@ PutResponse CraqReplication::handle_put(PutRequest request) {
         return response;
     }
 
-    int head_index = replication_common::head_index(request.key(), ring_size);
-    int tail_index = replication_common::tail_index(request.key(), ring_size);
+    int head_index = 0;
+    int tail_index = ring_size - 1;
 
     if (request.version() == 0) {
         if (node_index != head_index) {
@@ -202,7 +202,7 @@ GetResponse CraqReplication::handle_get(std::string key) {
         return response;
     }
 
-    int tail_index = replication_common::tail_index(key, ring_size);
+    int tail_index = ring_size - 1;
     uint64_t committed_version = 0;
     if (node_index == tail_index) {
         committed_version = get_committed_state(key).version;
@@ -280,7 +280,7 @@ void CraqReplication::handle_ack(int64_t request_id) {
         return;
     }
 
-    int head_index = replication_common::head_index(request.key(), ring_size);
+    int head_index = 0;
     if (node_index == head_index) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_acks.erase(request_id);
@@ -312,7 +312,7 @@ VersionQueryResponse CraqReplication::handle_version_query(
         response.set_error("NO_MEMBERSHIP");
         return response;
     }
-    int tail_index = replication_common::tail_index(request.key(), ring_size);
+    int tail_index = ring_size - 1;
     if (node_index != tail_index) {
         response.set_error("WRONG_NODE");
         return response;

@@ -24,12 +24,31 @@ ensure_dir_writable() {
         if mkdir -p "$dir" 2>/dev/null; then
             return
         fi
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        if command -v sudo >/dev/null 2>&1; then
+            if ! sudo -n true 2>/dev/null && [[ -t 0 ]]; then
+                echo "sudo needs your VM password to create shared directory: $dir"
+                sudo -v
+            fi
             sudo mkdir -p "$dir"
-            sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$dir"
+            sudo chown "$DEPLOY_USER":"$DEPLOY_USER" "$dir"
+            sudo chmod 2775 "$dir"
             return
         fi
         echo "ERROR: cannot create $dir. Configure REMOTE_BASE_DIR or sudo."
+        exit 1
+    fi
+
+    if [[ ! -w "$dir" ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            if ! sudo -n true 2>/dev/null && [[ -t 0 ]]; then
+                echo "sudo needs your VM password to make shared directory writable: $dir"
+                sudo -v
+            fi
+            sudo chown "$DEPLOY_USER":"$DEPLOY_USER" "$dir"
+            sudo chmod 2775 "$dir"
+            return
+        fi
+        echo "ERROR: $dir is not writable. Configure REMOTE_BASE_DIR or sudo."
         exit 1
     fi
 }
@@ -41,6 +60,7 @@ prepare_repo() {
     if [[ -e "$REPO_NAME" && ! -w "$REPO_NAME" ]]; then
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$REPO_NAME"
+            sudo chmod -R u+rwX,g+rwX,o+rX "$REPO_NAME"
         else
             echo "ERROR: $REMOTE_BASE_DIR/$REPO_NAME is not writable."
             exit 1
@@ -56,6 +76,7 @@ prepare_repo() {
         echo "Cloning fresh: $REPO_URL"
         git clone -b "$REPO_BRANCH" "$REPO_URL" "$REPO_NAME"
     fi
+    chmod -R u+rwX,g+rwX,o+rX "$REPO_NAME" 2>/dev/null || true
 }
 
 resolve_project_dir() {
@@ -124,13 +145,21 @@ start_server() {
     fi
     pkill -u "$DEPLOY_USER" -f "server .*--node-id ${NODE_ID} .*--listen .*:${NODE_PORT}" >/dev/null 2>&1 || true
 
+    : > "$log_file"
+    : > "$out_file"
+
     local server_cmd
-    server_cmd="cd '$PROJECT_DIR' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}'"
+    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR}' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}' 2>&1"
     echo "Run command: $server_cmd"
-    printf '[launch] %s\n' "$server_cmd" | tee -a "$log_file" >> "$out_file"
-    "${tmux_cmd[@]}" new-session -d -s "$SESSION_NAME" "$server_cmd"
+    {
+        echo "[launch] $(date -Is)"
+        echo "[host] $(hostname -f 2>/dev/null || hostname)"
+        echo "[session] $SESSION_NAME"
+        echo "[cmd] $server_cmd"
+    } | tee -a "$log_file" >> "$out_file"
+    "${tmux_cmd[@]}" new-session -d -s "$SESSION_NAME" "bash -lc $(printf '%q' "$server_cmd")"
     chmod 666 "$TMUX_SOCKET" 2>/dev/null || true
-    "${tmux_cmd[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat | tee -a '$log_file' >> '$out_file'"
+    "${tmux_cmd[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$log_file'"
     "${tmux_cmd[@]}" display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}" > "$pid_file"
 
     echo "Server started in tmux session: $SESSION_NAME"

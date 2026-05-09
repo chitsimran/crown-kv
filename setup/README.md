@@ -97,3 +97,15 @@ tmux sessions:
 - `crown_node_50051`
 
 Logs and pid files live under `run/shared/` in the remote project checkout.
+
+Useful log commands:
+
+```bash
+# metadata host
+tail -f /home/crown-kv/run/shared/metadata_50050.log
+
+# data node host
+tail -f /home/crown-kv/run/shared/server_50051.log
+```
+
+Each log starts with the launch timestamp, host, tmux session, and exact command.

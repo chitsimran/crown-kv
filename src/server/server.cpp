@@ -8,6 +8,7 @@
 #include <chrono>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -72,6 +73,18 @@ Replication* SelectReplicationForMode(const std::string& mode,
                                       ChainReplication* chain_replication,
                                       CraqReplication* craq_replication,
                                       CrownReplication* crown_replication);
+
+std::mutex log_mutex;
+
+void LogServerEvent(const std::string& event, const std::string& node_id,
+                    const std::string& mode, uint64_t local_epoch,
+                    const std::string& detail) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cout << "[" << event << "] node=" << node_id
+              << " mode=" << mode
+              << " local_epoch=" << local_epoch
+              << " " << detail << std::endl;
+}
 
 class MetadataClient {
 public:
@@ -218,9 +231,7 @@ private:
         InflightRequest inflight;
         inflight.set_origin_node_id(state_->node_id);
         inflight.set_epoch(epoch);
-        std::thread([this, inflight]() {
-            SendOriginInflight(inflight);
-        }).detach();
+        SendOriginInflight(inflight);
     }
 
     void SyncFromPeer(const std::vector<NodeInfo>& membership,
@@ -347,26 +358,50 @@ public:
         }
         uint64_t local_epoch = 0;
         std::string mode;
+        std::string node_id;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             local_epoch = state_->epoch;
             mode = state_->mode;
+            node_id = state_->node_id;
+        }
+        {
+            std::ostringstream detail;
+            detail << "request_id=" << request->request_id()
+                   << " key=" << request->key()
+                   << " version=" << request->version()
+                   << " request_epoch=" << request->epoch()
+                   << " client_addr=" << request->client_addr();
+            LogServerEvent("Put.recv", node_id, mode, local_epoch, detail.str());
         }
         Replication* replication = SelectReplication(mode);
         if (!replication) {
             response->set_success(false);
             response->set_error("WRONG_MODE");
+            LogServerEvent("Put.reject", node_id, mode, local_epoch, "error=WRONG_MODE");
             return grpc::Status::OK;
         }
         if (request->epoch() < local_epoch) {
             response->set_success(false);
             response->set_error("STALE_EPOCH");
+            LogServerEvent("Put.reject", node_id, mode, local_epoch, "error=STALE_EPOCH");
             return grpc::Status::OK;
         }
         if (request->epoch() > local_epoch) {
             RefreshMembershipAsync();
         }
         *response = replication->handle_put(*request);
+        {
+            std::ostringstream detail;
+            detail << "request_id=" << request->request_id()
+                   << " key=" << request->key()
+                   << " success=" << response->success()
+                   << " version=" << response->version();
+            if (!response->error().empty()) {
+                detail << " error=" << response->error();
+            }
+            LogServerEvent("Put.resp", node_id, mode, local_epoch, detail.str());
+        }
         return grpc::Status::OK;
     }
 
@@ -374,26 +409,52 @@ public:
                             PutResponse* response) override {
         uint64_t local_epoch = 0;
         std::string mode;
+        std::string node_id;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             local_epoch = state_->epoch;
             mode = state_->mode;
+            node_id = state_->node_id;
+        }
+        {
+            std::ostringstream detail;
+            detail << "request_id=" << request->request_id()
+                   << " key=" << request->key()
+                   << " version=" << request->version()
+                   << " request_epoch=" << request->epoch()
+                   << " client_addr=" << request->client_addr();
+            LogServerEvent("ForwardPut.recv", node_id, mode, local_epoch, detail.str());
         }
         Replication* replication = SelectReplication(mode);
         if (!replication) {
             response->set_success(false);
             response->set_error("WRONG_MODE");
+            LogServerEvent("ForwardPut.reject", node_id, mode, local_epoch,
+                           "error=WRONG_MODE");
             return grpc::Status::OK;
         }
         if (request->epoch() < local_epoch) {
             response->set_success(false);
             response->set_error("STALE_EPOCH");
+            LogServerEvent("ForwardPut.reject", node_id, mode, local_epoch,
+                           "error=STALE_EPOCH");
             return grpc::Status::OK;
         }
         if (request->epoch() > local_epoch) {
             RefreshMembershipAsync();
         }
         *response = replication->handle_put(*request);
+        {
+            std::ostringstream detail;
+            detail << "request_id=" << request->request_id()
+                   << " key=" << request->key()
+                   << " success=" << response->success()
+                   << " version=" << response->version();
+            if (!response->error().empty()) {
+                detail << " error=" << response->error();
+            }
+            LogServerEvent("ForwardPut.resp", node_id, mode, local_epoch, detail.str());
+        }
         return grpc::Status::OK;
     }
 
@@ -426,18 +487,32 @@ public:
                               WriteAckResponse* response) override {
         uint64_t local_epoch = 0;
         std::string mode;
+        std::string node_id;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             local_epoch = state_->epoch;
             mode = state_->mode;
+            node_id = state_->node_id;
+        }
+        {
+            std::ostringstream detail;
+            detail << "request_id=" << request->request_id()
+                   << " key=" << request->key()
+                   << " version=" << request->version()
+                   << " request_epoch=" << request->epoch();
+            LogServerEvent("WriteAck.recv", node_id, mode, local_epoch, detail.str());
         }
         Replication* replication = SelectReplication(mode);
         if (!replication) {
             response->set_success(false);
+            LogServerEvent("WriteAck.reject", node_id, mode, local_epoch,
+                           "error=WRONG_MODE");
             return grpc::Status::OK;
         }
         if (request->epoch() < local_epoch) {
             response->set_success(false);
+            LogServerEvent("WriteAck.reject", node_id, mode, local_epoch,
+                           "error=STALE_EPOCH");
             return grpc::Status::OK;
         }
         if (request->epoch() > local_epoch) {
@@ -445,6 +520,7 @@ public:
         }
         replication->handle_ack(request->request_id());
         response->set_success(true);
+        LogServerEvent("WriteAck.resp", node_id, mode, local_epoch, "success=true");
         return grpc::Status::OK;
     }
 
@@ -461,10 +537,7 @@ public:
             return grpc::Status::OK;
         }
 
-        InflightRequest inflight = *request;
-        std::thread([this, replication, inflight]() {
-            HandleInflight(replication, inflight);
-        }).detach();
+        HandleInflight(replication, *request);
         return grpc::Status::OK;
     }
 
@@ -588,31 +661,29 @@ private:
     }
 
     void RefreshMembershipAsync() {
-        std::thread([this]() {
-            MembershipResponse membership_response;
-            if (!metadata_client_->GetMembership(&membership_response)) {
+        MembershipResponse membership_response;
+        if (!metadata_client_->GetMembership(&membership_response)) {
+            return;
+        }
+        std::vector<NodeInfo> membership_copy;
+        std::string node_id;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (membership_response.epoch() < state_->epoch) {
                 return;
             }
-            std::vector<NodeInfo> membership_copy;
-            std::string node_id;
-            {
-                std::lock_guard<std::mutex> lock(state_->mutex);
-                if (membership_response.epoch() < state_->epoch) {
-                    return;
-                }
-                state_->epoch = membership_response.epoch();
-                state_->mode = membership_response.mode();
-                state_->membership.assign(membership_response.membership().begin(),
-                                          membership_response.membership().end());
-                membership_copy = state_->membership;
-                node_id = state_->node_id;
-            }
-            chain_replication_->update_membership(membership_copy, node_id);
-            craq_replication_->update_membership(membership_copy, node_id);
-            craq_replication_->set_epoch(membership_response.epoch());
-            crown_replication_->update_membership(membership_copy, node_id);
-            crown_replication_->set_epoch(membership_response.epoch());
-        }).detach();
+            state_->epoch = membership_response.epoch();
+            state_->mode = membership_response.mode();
+            state_->membership.assign(membership_response.membership().begin(),
+                                      membership_response.membership().end());
+            membership_copy = state_->membership;
+            node_id = state_->node_id;
+        }
+        chain_replication_->update_membership(membership_copy, node_id);
+        craq_replication_->update_membership(membership_copy, node_id);
+        craq_replication_->set_epoch(membership_response.epoch());
+        crown_replication_->update_membership(membership_copy, node_id);
+        crown_replication_->set_epoch(membership_response.epoch());
     }
 
     ServerState* state_;

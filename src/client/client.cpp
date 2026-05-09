@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -99,6 +100,23 @@ struct MembershipState {
     std::vector<std::shared_ptr<ReplicationService::Stub>> stubs;
 };
 
+std::string MemberAddressAt(const MembershipState& membership, int index) {
+    if (index < 0 || index >= static_cast<int>(membership.members.size())) {
+        return "<invalid>";
+    }
+    return replication_common::address_from_node(membership.members[index]);
+}
+
+void PrintRouteDebug(const std::string& op, const MembershipState& membership,
+                     const std::string& key, int index, int attempt) {
+    std::cout << op << " route: mode=" << membership.mode
+              << " epoch=" << membership.epoch
+              << " key=" << key
+              << " index=" << index
+              << " target=" << MemberAddressAt(membership, index)
+              << " attempt=" << attempt << std::endl;
+}
+
 bool FetchMembership(const std::unique_ptr<MetadataService::Stub>& stub,
                      MembershipState* state) {
     MembershipRequest request;
@@ -144,6 +162,9 @@ int SelectWriteNodeIndex(const MembershipState& membership, const std::string& k
     if (ring_size == 0) {
         return -1;
     }
+    if (membership.mode == "CHAIN" || membership.mode == "CRAQ") {
+        return 0;
+    }
     return replication_common::head_index(key, ring_size);
 }
 
@@ -153,7 +174,7 @@ int SelectReadNodeIndex(const MembershipState& membership, const std::string& ke
         return -1;
     }
     if (membership.mode == "CHAIN") {
-        return replication_common::tail_index(key, ring_size);
+        return ring_size - 1;
     }
     return replication_common::head_index(key, ring_size);
 }
@@ -165,8 +186,14 @@ bool SendPutWithRetry(const std::string& key, const std::string& value,
     for (int attempt = 0; attempt < 3; ++attempt) {
         int index = SelectWriteNodeIndex(*membership, key);
         if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
+            std::cout << "put route error: mode=" << membership->mode
+                      << " epoch=" << membership->epoch
+                      << " key=" << key
+                      << " selected_index=" << index
+                      << " members=" << membership->members.size() << std::endl;
             return false;
         }
+        PrintRouteDebug("put", *membership, key, index, attempt + 1);
         PutRequest request;
         request.set_request_id((*request_id)++);
         request.set_key(key);
@@ -179,15 +206,21 @@ bool SendPutWithRetry(const std::string& key, const std::string& value,
         grpc::ClientContext context;
         grpc::Status status = membership->stubs[index]->Put(&context, request, &response);
         if (!status.ok()) {
+            std::cout << "put rpc failed: code=" << status.error_code()
+                      << " message=" << status.error_message() << std::endl;
             continue;
         }
         if (response.success()) {
             *out_response = response;
             return true;
         }
+        std::cout << "put response error: " << response.error()
+                  << " version=" << response.version() << std::endl;
         if (response.error().rfind("WRONG_NODE", 0) == 0 ||
             response.error() == "STALE_EPOCH") {
+            std::cout << "refreshing membership after " << response.error() << std::endl;
             if (!FetchMembership(metadata_stub, membership)) {
+                std::cout << "membership refresh failed" << std::endl;
                 return false;
             }
             continue;
@@ -204,8 +237,14 @@ bool SendGetWithRetry(const std::string& key,
     for (int attempt = 0; attempt < 3; ++attempt) {
         int index = SelectReadNodeIndex(*membership, key);
         if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
+            std::cout << "get route error: mode=" << membership->mode
+                      << " epoch=" << membership->epoch
+                      << " key=" << key
+                      << " selected_index=" << index
+                      << " members=" << membership->members.size() << std::endl;
             return false;
         }
+        PrintRouteDebug("get", *membership, key, index, attempt + 1);
         GetRequest request;
         request.set_key(key);
         request.set_epoch(membership->epoch);
@@ -213,10 +252,15 @@ bool SendGetWithRetry(const std::string& key,
         grpc::ClientContext context;
         grpc::Status status = membership->stubs[index]->Get(&context, request, &response);
         if (!status.ok()) {
+            std::cout << "get rpc failed: code=" << status.error_code()
+                      << " message=" << status.error_message() << std::endl;
             continue;
         }
         if (response.error() == "WRONG_NODE" || response.error() == "STALE_EPOCH") {
+            std::cout << "get response error: " << response.error()
+                      << "; refreshing membership" << std::endl;
             if (!FetchMembership(metadata_stub, membership)) {
+                std::cout << "membership refresh failed" << std::endl;
                 return false;
             }
             continue;
@@ -246,7 +290,7 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [key] [value]      Issue N writes, e.g. bench 100 k v\n"
+        << "  bench N [key] [value]      Single-threaded async open-loop writes\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -417,21 +461,98 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::lock_guard<std::mutex> lock(state->mutex);
                 start_completed = state->completed;
             }
+
+            struct AsyncPutCall {
+                uint64_t index = 0;
+                std::string key;
+                PendingEntry entry;
+                grpc::ClientContext context;
+                PutResponse response;
+                grpc::Status status;
+                std::unique_ptr<grpc::ClientAsyncResponseReader<PutResponse>> rpc;
+            };
+
+            std::vector<std::pair<std::string, std::string>> workload;
+            workload.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                workload.emplace_back(key_prefix + std::to_string(i),
+                                      value_prefix + std::to_string(i));
+            }
+
+            grpc::CompletionQueue completion_queue;
+            std::vector<std::unique_ptr<AsyncPutCall>> calls;
+            calls.reserve(count);
+            uint64_t failed = 0;
+            auto rpc_deadline = std::chrono::system_clock::now() + std::chrono::seconds(30);
             auto bench_start = std::chrono::steady_clock::now();
             for (uint64_t i = 0; i < count; ++i) {
-                std::string key = key_prefix + std::to_string(i);
-                std::string value = value_prefix + std::to_string(i);
-                PendingEntry entry{std::chrono::steady_clock::now()};
-                PutResponse response;
-                if (!SendPutWithRetry(key, value, listen_addr, request_id, metadata_stub,
-                                      membership, &response) ||
-                    !response.success()) {
-                    std::cout << "put failed at " << i << std::endl;
+                int index = SelectWriteNodeIndex(*membership, workload[i].first);
+                if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
+                    failed += 1;
+                    if (failed <= 10) {
+                        std::cout << "bench route error: mode=" << membership->mode
+                                  << " epoch=" << membership->epoch
+                                  << " key=" << workload[i].first
+                                  << " selected_index=" << index
+                                  << " members=" << membership->members.size() << std::endl;
+                    }
                     continue;
                 }
-                RecordAcceptedWrite(state, PendingKey{key, response.version()}, entry);
+
+                auto call = std::make_unique<AsyncPutCall>();
+                call->index = i;
+                call->key = workload[i].first;
+                call->entry = PendingEntry{std::chrono::steady_clock::now()};
+                call->context.set_deadline(rpc_deadline);
+
+                PutRequest request;
+                request.set_request_id((*request_id)++);
+                request.set_key(workload[i].first);
+                request.set_value(workload[i].second);
+                request.set_version(0);
+                request.set_client_addr(listen_addr);
+                request.set_epoch(membership->epoch);
+
+                auto* tag = call.get();
+                call->rpc = membership->stubs[index]->PrepareAsyncPut(
+                    &call->context, request, &completion_queue);
+                call->rpc->StartCall();
+                call->rpc->Finish(&call->response, &call->status, tag);
+                calls.push_back(std::move(call));
+            }
+
+            void* tag = nullptr;
+            bool ok = false;
+            uint64_t completed_acceptances = 0;
+            while (completed_acceptances < calls.size() &&
+                   completion_queue.Next(&tag, &ok)) {
+                completed_acceptances += 1;
+                auto* call = static_cast<AsyncPutCall*>(tag);
+                if (!ok || !call->status.ok() || !call->response.success()) {
+                    failed += 1;
+                    if (failed <= 10) {
+                        std::cout << "put failed at " << call->index;
+                        if (!call->response.error().empty()) {
+                            std::cout << ": " << call->response.error();
+                        } else if (!call->status.ok()) {
+                            std::cout << ": " << call->status.error_message();
+                        }
+                        std::cout << " target="
+                                  << MemberAddressAt(*membership,
+                                                     SelectWriteNodeIndex(*membership,
+                                                                         call->key))
+                                  << " mode=" << membership->mode
+                                  << " epoch=" << membership->epoch;
+                        std::cout << std::endl;
+                    }
+                    continue;
+                }
+                RecordAcceptedWrite(state, PendingKey{call->key, call->response.version()},
+                                    call->entry);
                 accepted += 1;
             }
+            completion_queue.Shutdown();
+
             {
                 std::unique_lock<std::mutex> lock(state->mutex);
                 state->cv.wait(lock, [&]() {
@@ -441,7 +562,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
                 std::chrono::steady_clock::now() - bench_start);
             std::cout << "committed " << accepted << " writes in " << elapsed.count()
-                      << "s (" << (accepted / elapsed.count()) << " ops/sec)" << std::endl;
+                      << "s (" << (accepted / elapsed.count()) << " ops/sec)"
+                      << ", failed " << failed
+                      << ", async single-threaded" << std::endl;
         } else if (command == "pending") {
             PrintClientStats(state);
         } else {
