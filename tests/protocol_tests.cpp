@@ -60,7 +60,6 @@ void test_crown_single_node_put_commits_and_reads_clean_value() {
     request.set_value("committed");
     request.set_version(0);
     request.set_client_addr("invalid-client-address");
-    request.set_epoch(1);
 
     auto put_response = crown.handle_put(request);
     assert(put_response.success());
@@ -82,7 +81,6 @@ void test_crown_rejects_client_write_at_non_head() {
     request.set_key(key_with_head_not_zero(2));
     request.set_value("wrong-node");
     request.set_version(0);
-    request.set_epoch(1);
 
     auto response = crown.handle_put(request);
     assert(!response.success());
@@ -123,7 +121,6 @@ void test_chain_uses_fixed_head_for_client_writes() {
     request.set_value("fixed-head");
     request.set_version(0);
     request.set_client_addr("invalid-client-address");
-    request.set_epoch(1);
 
     auto response = chain.handle_put(request);
     assert(response.success());
@@ -139,7 +136,6 @@ void test_chain_rejects_client_write_at_non_fixed_head() {
     request.set_key("any-key");
     request.set_value("wrong-head");
     request.set_version(0);
-    request.set_epoch(1);
 
     auto response = chain.handle_put(request);
     assert(!response.success());

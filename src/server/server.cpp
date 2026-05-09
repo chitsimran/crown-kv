@@ -276,7 +276,8 @@ public:
             detail << "request_id=" << request->request_id()
                    << " key=" << request->key()
                    << " version=" << request->version()
-                   << " request_epoch=" << request->epoch()
+                   << " client_epoch_ignored=" << request->epoch()
+                   << " stamped_epoch=" << local_epoch
                    << " client_addr=" << request->client_addr();
             LogServerEvent("Put.recv", node_id, mode, local_epoch, detail.str());
         }
@@ -287,20 +288,13 @@ public:
             LogServerEvent("Put.reject", node_id, mode, local_epoch, "error=WRONG_MODE");
             return grpc::Status::OK;
         }
-        if (request->epoch() < local_epoch) {
-            response->set_success(false);
-            response->set_error("STALE_EPOCH");
-            LogServerEvent("Put.reject", node_id, mode, local_epoch, "error=STALE_EPOCH");
-            return grpc::Status::OK;
-        }
-        if (request->epoch() > local_epoch) {
-            RefreshMembershipAsync();
-        }
-        *response = replication->handle_put(*request);
+        PutRequest stamped_request = *request;
+        stamped_request.set_epoch(local_epoch);
+        *response = replication->handle_put(stamped_request);
         {
             std::ostringstream detail;
-            detail << "request_id=" << request->request_id()
-                   << " key=" << request->key()
+            detail << "request_id=" << stamped_request.request_id()
+                   << " key=" << stamped_request.key()
                    << " success=" << response->success()
                    << " version=" << response->version();
             if (!response->error().empty()) {
@@ -378,14 +372,9 @@ public:
             response->set_error("WRONG_MODE");
             return grpc::Status::OK;
         }
-        if (request->epoch() < local_epoch) {
-            response->set_error("STALE_EPOCH");
-            return grpc::Status::OK;
-        }
-        if (request->epoch() > local_epoch) {
-            RefreshMembershipAsync();
-        }
-        *response = replication->handle_get(request->key());
+        GetRequest stamped_request = *request;
+        stamped_request.set_epoch(local_epoch);
+        *response = replication->handle_get(stamped_request.key());
         return grpc::Status::OK;
     }
 

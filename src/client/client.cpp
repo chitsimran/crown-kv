@@ -202,7 +202,6 @@ bool SendPutWithRetry(const std::string& key, const std::string& value,
         request.set_value(value);
         request.set_version(0);
         request.set_client_addr(client_addr);
-        request.set_epoch(membership->epoch);
 
         PutResponse response;
         grpc::ClientContext context;
@@ -249,7 +248,6 @@ bool SendGetWithRetry(const std::string& key,
         PrintRouteDebug("get", *membership, key, index, attempt + 1);
         GetRequest request;
         request.set_key(key);
-        request.set_epoch(membership->epoch);
         GetResponse response;
         grpc::ClientContext context;
         grpc::Status status = membership->stubs[index]->Get(&context, request, &response);
@@ -634,7 +632,6 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 request.set_value(workload[i].second);
                 request.set_version(0);
                 request.set_client_addr(listen_addr);
-                request.set_epoch(membership->epoch);
 
                 auto* tag = call.get();
                 call->rpc = membership->stubs[index]->PrepareAsyncPut(
