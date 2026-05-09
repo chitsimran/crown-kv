@@ -317,7 +317,7 @@ void PrintHelp() {
         << "                             CSV produced by setup/generate_kv_dataset.py.\n"
         << "                             hot% is the share of writes targeting hot keys;\n"
         << "                             hot-set% is the share of unique keys in the hot\n"
-        << "                             pool. window-ms defaults to 500. Throughput CSV\n"
+        << "                             pool. window-ms defaults to 1000. Throughput CSV\n"
         << "                             and PNG default to bench_results/throughput_*.{csv,png}.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
@@ -682,7 +682,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                           << "  csv-path     defaults to setup/generated_kv_dataset/all_kv_pairs.csv\n"
                           << "  hot-share    0-100, percentage of writes targeting hot keys (default 0)\n"
                           << "  hot-set-share 1-100, percentage of unique keys in the hot pool (default 10)\n"
-                          << "  window-ms    sliding throughput window in milliseconds (default 500)\n"
+                          << "  window-ms    sliding throughput window in milliseconds (default 1000)\n"
                           << "  output-prefix defaults to bench_results/throughput_<timestamp>"
                           << std::endl;
                 continue;
@@ -693,7 +693,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 : std::string("setup/generated_kv_dataset/all_kv_pairs.csv");
             int hot_share = words.size() >= 4 ? std::stoi(words[3]) : 0;
             int hot_set_share = words.size() >= 5 ? std::stoi(words[4]) : 10;
-            int window_ms = words.size() >= 6 ? std::stoi(words[5]) : 500;
+            int window_ms = words.size() >= 6 ? std::stoi(words[5]) : 1000;
             std::string output_prefix = words.size() >= 7 ? words[6] : "";
             if (hot_share < 0 || hot_share > 100) {
                 std::cout << "hot-share must be 0-100" << std::endl;
