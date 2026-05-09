@@ -27,10 +27,11 @@ public:
     struct PendingEntry {
         PutRequest request;
         std::chrono::steady_clock::time_point deadline;
+        int retry_count = 0;
     };
 
     KVStore kv_store;
-    
+
     // passed on by server in constructor // key -> head node
     std::unordered_map<char, std::shared_ptr<ReplicationService::Stub>> key_mapping;
 
@@ -39,7 +40,6 @@ public:
 
     std::unordered_map<int64_t, PendingEntry> pending_acks; // request_id -> entry
     std::mutex pending_mutex_;
-    std::function<void(const PutRequest&)> forward_failure_handler;
 
     void add_to_pending_acks(PutRequest request);
     void erase_pending_ack(int64_t request_id);
@@ -72,7 +72,6 @@ private:
     struct ForwardTask {
         PutRequest request;
         std::shared_ptr<ReplicationService::Stub> stub;
-        std::function<void(const PutRequest&)> failure_handler;
     };
 
     void enqueue_forward_task(ForwardTask task);

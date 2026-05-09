@@ -32,8 +32,6 @@ using replication::PutRequest;
 using replication::PutResponse;
 using replication::ReconfigureRequest;
 using replication::ReconfigureResponse;
-using replication::ReportFailureRequest;
-using replication::ReportFailureResponse;
 using replication::ReplicationService;
 using replication::StateDumpRequest;
 using replication::StateDumpResponse;
@@ -66,7 +64,6 @@ struct ServerState {
     std::atomic<NodeState> state{NodeState::STARTING};
     std::atomic<bool> drain_active{false};
     uint64_t drain_epoch = 0;
-    std::unordered_map<std::string, int> forward_failures;
 };
 
 Replication* SelectReplicationForMode(const std::string& mode,
@@ -121,18 +118,6 @@ public:
         }
         *out_epoch = response.epoch();
         return response.alive();
-    }
-
-    bool ReportFailure(const std::string& reporter_node_id,
-                       const std::string& failed_node_id, uint64_t epoch) {
-        ReportFailureRequest request;
-        request.set_reporter_node_id(reporter_node_id);
-        request.set_failed_node_id(failed_node_id);
-        request.set_epoch(epoch);
-        ReportFailureResponse response;
-        grpc::ClientContext context;
-        grpc::Status status = stub_->ReportFailure(&context, request, &response);
-        return status.ok() && response.success();
     }
 
     bool SendSyncComplete(const std::string& node_id, uint64_t epoch) {
@@ -766,15 +751,25 @@ void RetryLoop(ServerState* state, ChainReplication* chain_replication,
                std::atomic<bool>* shutdown_flag) {
     while (!shutdown_flag->load()) {
         std::string mode;
+        uint64_t local_epoch = 0;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             mode = state->mode;
+            local_epoch = state->epoch;
         }
         Replication* replication = SelectReplicationForMode(
             mode, chain_replication, craq_replication, crown_replication);
         if (replication) {
             auto expired = replication->collect_expired_requests();
             auto next_stub = replication->get_next_stub();
+            if (!expired.empty()) {
+                std::ostringstream detail;
+                detail << "expired_count=" << expired.size()
+                       << " pending_total=" << replication->pending_count()
+                       << " has_next_stub=" << (next_stub ? 1 : 0);
+                LogServerEvent("RetryLoop.fire", state->node_id, mode, local_epoch,
+                               detail.str());
+            }
             if (next_stub) {
                 for (const auto& request : expired) {
                     replication->forward_put(request, next_stub);
@@ -783,44 +778,6 @@ void RetryLoop(ServerState* state, ChainReplication* chain_replication,
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(kRetryIntervalMs));
     }
-}
-
-std::string CurrentSuccessorNodeId(ServerState* state) {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    int ring_size = static_cast<int>(state->membership.size());
-    if (ring_size <= 1) {
-        return "";
-    }
-    for (int i = 0; i < ring_size; ++i) {
-        if (state->membership[i].node_id() == state->node_id) {
-            return state->membership[(i + 1) % ring_size].node_id();
-        }
-    }
-    return "";
-}
-
-void InstallForwardFailureHandler(ServerState* state, MetadataClient* metadata_client,
-                                  Replication* replication) {
-    replication->forward_failure_handler =
-        [state, metadata_client](const PutRequest&) {
-            std::string failed_node_id = CurrentSuccessorNodeId(state);
-            if (failed_node_id.empty()) {
-                return;
-            }
-            uint64_t epoch = 0;
-            int failures = 0;
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                epoch = state->epoch;
-                failures = ++state->forward_failures[failed_node_id];
-            }
-            if (failures >= 3) {
-                if (metadata_client->ReportFailure(state->node_id, failed_node_id, epoch)) {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->forward_failures[failed_node_id] = 0;
-                }
-            }
-        };
 }
 
 } // namespace
@@ -854,9 +811,6 @@ int main(int argc, char** argv) {
     CrownReplication crown_replication;
 
     MetadataClient metadata_client(metadata_addr);
-    InstallForwardFailureHandler(&state, &metadata_client, &chain_replication);
-    InstallForwardFailureHandler(&state, &metadata_client, &craq_replication);
-    InstallForwardFailureHandler(&state, &metadata_client, &crown_replication);
     RefreshMembership(&state, &metadata_client, &chain_replication, &craq_replication,
                       &crown_replication);
 

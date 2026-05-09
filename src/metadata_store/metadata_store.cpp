@@ -176,6 +176,15 @@ public:
 
     grpc::Status ReportFailure(grpc::ServerContext*, const ReportFailureRequest* request,
                                ReportFailureResponse* response) override {
+        uint64_t current_epoch = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            current_epoch = state_->epoch;
+        }
+        std::cerr << "[metadata] ReportFailure received reporter=" << request->reporter_node_id()
+                  << " failed=" << request->failed_node_id()
+                  << " request_epoch=" << request->epoch()
+                  << " current_epoch=" << current_epoch << std::endl;
         response->set_success(true);
         std::thread(TriggerReconfigureRemove, state_, request->failed_node_id()).detach();
         return grpc::Status::OK;
@@ -232,6 +241,8 @@ void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_nod
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->reconfig_in_progress.exchange(true)) {
+            std::cerr << "[metadata] TriggerReconfigureRemove skipped (already in progress)"
+                      << " failed=" << failed_node_id << std::endl;
             return;
         }
         old_epoch = state->epoch;
@@ -247,12 +258,19 @@ void TriggerReconfigureRemove(ClusterState* state, const std::string& failed_nod
         }
         if (!found_failed_node) {
             state->reconfig_in_progress.store(false);
+            std::cerr << "[metadata] TriggerReconfigureRemove skipped (node not in membership)"
+                      << " failed=" << failed_node_id << std::endl;
             return;
         }
         state->drain_epoch = old_epoch;
         state->expected_drain_acks = new_membership.size();
         state->drain_acks.clear();
     }
+    std::cerr << "[metadata] TriggerReconfigureRemove start"
+              << " failed=" << failed_node_id
+              << " old_epoch=" << old_epoch
+              << " new_epoch=" << (old_epoch + 1)
+              << " survivors=" << new_membership.size() << std::endl;
 
     std::vector<NodeInfo> freeze_confirmed_membership;
     for (const auto& node : old_membership) {
@@ -378,7 +396,7 @@ void TriggerModeChange(ClusterState* state, const std::string& mode) {
 void MonitorFailures(ClusterState* state, std::atomic<bool>* shutdown_flag) {
     while (!shutdown_flag->load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(kHeartbeatIntervalMs));
-        std::vector<std::string> failed_nodes;
+        std::vector<std::pair<std::string, int64_t>> failed_nodes;
         auto now = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -390,12 +408,18 @@ void MonitorFailures(ClusterState* state, std::atomic<bool>* shutdown_flag) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - it->second);
                 if (elapsed.count() > kHeartbeatIntervalMs * kHeartbeatMissThreshold) {
-                    failed_nodes.push_back(member.node_id());
+                    failed_nodes.emplace_back(member.node_id(), elapsed.count());
                 }
             }
         }
         if (!failed_nodes.empty()) {
-            TriggerReconfigureRemove(state, failed_nodes.front());
+            std::cerr << "[metadata] MonitorFailures detected dead node="
+                      << failed_nodes.front().first
+                      << " elapsed_ms=" << failed_nodes.front().second
+                      << " threshold_ms="
+                      << (static_cast<int64_t>(kHeartbeatIntervalMs) * kHeartbeatMissThreshold)
+                      << std::endl;
+            TriggerReconfigureRemove(state, failed_nodes.front().first);
         }
     }
 }
