@@ -66,6 +66,17 @@ struct CommitEvent {
     uint64_t benchmark_id = 0;
 };
 
+struct KvRow {
+    std::string key;
+    std::string value;
+};
+
+struct WorkloadItem {
+    std::string key;
+    std::string value;
+    int target_index = -1;
+};
+
 struct ClientState {
     std::mutex mutex;
     std::condition_variable cv;
@@ -319,6 +330,7 @@ void PrintHelp() {
         << "                             hot-set% is the share of unique keys in the hot\n"
         << "                             pool. window-ms defaults to 1000. Throughput CSV\n"
         << "                             and PNG default to bench_results/throughput_*.{csv,png}.\n"
+        << "                             Key target nodes are precomputed before timing.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -381,8 +393,7 @@ bool WaitForCommit(ClientState* state, const PendingKey& pending_key, int timeou
 // Loads a CSV produced by setup/generate_kv_dataset.py. The file has a header
 // row "key,value" followed by alphabetic 10-byte keys and 64-byte values. We
 // read every row eagerly so the bench command never builds keys on the fly.
-bool LoadDatasetCsv(const std::string& path,
-                    std::vector<std::pair<std::string, std::string>>* out) {
+bool LoadDatasetCsv(const std::string& path, std::vector<KvRow>* out) {
     std::ifstream file(path);
     if (!file.is_open()) {
         std::cerr << "failed to open dataset file: " << path << std::endl;
@@ -403,9 +414,86 @@ bool LoadDatasetCsv(const std::string& path,
         if (comma == std::string::npos) {
             continue;
         }
-        out->emplace_back(line.substr(0, comma), line.substr(comma + 1));
+        out->push_back(KvRow{line.substr(0, comma), line.substr(comma + 1)});
     }
     return !out->empty();
+}
+
+std::string RouteCacheKey(const std::string& csv_path,
+                          const MembershipState& membership) {
+    std::ostringstream key;
+    key << csv_path << '|' << membership.mode << '|' << membership.epoch;
+    for (const auto& member : membership.members) {
+        key << '|' << member.node_id() << '@'
+            << replication_common::address_from_node(member);
+    }
+    return key.str();
+}
+
+std::vector<uint64_t> CountTargets(const std::vector<WorkloadItem>& rows,
+                                   size_t member_count) {
+    std::vector<uint64_t> counts(member_count, 0);
+    for (const auto& row : rows) {
+        if (row.target_index >= 0 &&
+            row.target_index < static_cast<int>(counts.size())) {
+            counts[row.target_index] += 1;
+        }
+    }
+    return counts;
+}
+
+uint64_t SumCounts(const std::vector<uint64_t>& counts) {
+    uint64_t total = 0;
+    for (uint64_t count : counts) {
+        total += count;
+    }
+    return total;
+}
+
+void PrintTargetCounts(const std::string& label,
+                       const MembershipState& membership,
+                       const std::vector<uint64_t>& counts,
+                       const std::string& unit) {
+    uint64_t total = SumCounts(counts);
+    std::cout << label << " (mode=" << membership.mode
+              << " epoch=" << membership.epoch
+              << ", total=" << total << ")" << std::endl;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        double pct = total > 0
+            ? (100.0 * static_cast<double>(counts[i]) / static_cast<double>(total))
+            : 0.0;
+        std::ostringstream pct_text;
+        pct_text << std::fixed << std::setprecision(2) << pct;
+        std::cout << "  " << membership.members[i].node_id()
+                  << " @ " << MemberAddressAt(membership, static_cast<int>(i))
+                  << ": " << counts[i] << " " << unit
+                  << " (" << pct_text.str() << "%)" << std::endl;
+    }
+}
+
+bool PrecomputeWriteRoutes(const std::vector<KvRow>& dataset,
+                           const MembershipState& membership,
+                           std::vector<WorkloadItem>* routed_dataset) {
+    routed_dataset->clear();
+    routed_dataset->reserve(dataset.size());
+    bool ok = true;
+    int printed_errors = 0;
+    for (const auto& row : dataset) {
+        int index = SelectWriteNodeIndex(membership, row.key);
+        if (index < 0 || index >= static_cast<int>(membership.stubs.size())) {
+            ok = false;
+            if (printed_errors < 10) {
+                std::cout << "route precompute error: mode=" << membership.mode
+                          << " epoch=" << membership.epoch
+                          << " key=" << row.key
+                          << " selected_index=" << index
+                          << " members=" << membership.members.size() << std::endl;
+                printed_errors += 1;
+            }
+        }
+        routed_dataset->push_back(WorkloadItem{row.key, row.value, index});
+    }
+    return ok;
 }
 
 // Mirrors apply_hot_skew in setup/generate_kv_dataset.py: hot_share% of writes
@@ -413,10 +501,10 @@ bool LoadDatasetCsv(const std::string& path,
 // remainder cycles through the rest. Hot rows come first, then cold rows —
 // matching the python script so behavior is consistent across pre-baked CSVs
 // and client-side skewing.
-std::vector<std::pair<std::string, std::string>> BuildSkewedWorkload(
-    const std::vector<std::pair<std::string, std::string>>& dataset,
+std::vector<WorkloadItem> BuildSkewedWorkload(
+    const std::vector<WorkloadItem>& dataset,
     uint64_t total_count, int hot_share, int hot_set_share) {
-    std::vector<std::pair<std::string, std::string>> workload;
+    std::vector<WorkloadItem> workload;
     if (dataset.empty() || total_count == 0) {
         return workload;
     }
@@ -710,8 +798,13 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
 
             // Cache the dataset across bench invocations: re-reading 20K+ rows
             // from disk per call is wasteful and noisy. Reload only on path change.
+            if (!FetchMembership(metadata_stub, membership)) {
+                std::cout << "bench aborted: membership refresh failed" << std::endl;
+                continue;
+            }
+
             static std::string cached_path;
-            static std::vector<std::pair<std::string, std::string>> cached_dataset;
+            static std::vector<KvRow> cached_dataset;
             if (csv_path != cached_path || cached_dataset.empty()) {
                 auto load_start = std::chrono::steady_clock::now();
                 if (!LoadDatasetCsv(csv_path, &cached_dataset)) {
@@ -727,11 +820,39 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                           << csv_path << " (" << load_ms << " ms)" << std::endl;
             }
 
-            // Build the full workload before any timing starts. Once the timed
-            // section opens, no more key/value materialization happens.
+            static std::string cached_route_key;
+            static std::vector<WorkloadItem> cached_routed_dataset;
+            std::string route_key = RouteCacheKey(csv_path, *membership);
+            if (route_key != cached_route_key ||
+                cached_routed_dataset.size() != cached_dataset.size()) {
+                auto route_start = std::chrono::steady_clock::now();
+                if (!PrecomputeWriteRoutes(cached_dataset, *membership,
+                                           &cached_routed_dataset)) {
+                    cached_route_key.clear();
+                    cached_routed_dataset.clear();
+                    std::cout << "bench aborted: could not precompute write routes"
+                              << std::endl;
+                    continue;
+                }
+                cached_route_key = route_key;
+                auto route_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - route_start).count();
+                std::cout << "precomputed write targets for "
+                          << cached_routed_dataset.size() << " keys"
+                          << " (" << route_ms << " ms)" << std::endl;
+                PrintTargetCounts("dataset target distribution", *membership,
+                                  CountTargets(cached_routed_dataset,
+                                               membership->members.size()),
+                                  "keys");
+            }
+
+            // Build the full routed workload before any timing starts. Once the
+            // timed section opens, no more key/value materialization or routing
+            // hash calculation happens.
             auto build_start = std::chrono::steady_clock::now();
-            std::vector<std::pair<std::string, std::string>> workload =
-                BuildSkewedWorkload(cached_dataset, count, hot_share, hot_set_share);
+            std::vector<WorkloadItem> workload =
+                BuildSkewedWorkload(cached_routed_dataset, count, hot_share,
+                                    hot_set_share);
             if (workload.size() != count) {
                 std::cout << "bench aborted: workload empty (dataset size="
                           << cached_dataset.size() << ")" << std::endl;
@@ -743,6 +864,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                       << " hot_share=" << hot_share << "%"
                       << " hot_set_share=" << hot_set_share << "%"
                       << " (" << build_ms << " ms)" << std::endl;
+            PrintTargetCounts("planned write distribution", *membership,
+                              CountTargets(workload, membership->members.size()),
+                              "writes");
 
             uint64_t benchmark_id = 0;
             size_t first_commit_event = 0;
@@ -756,6 +880,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             struct AsyncPutCall {
                 uint64_t index = 0;
                 std::string key;
+                int target_index = -1;
                 PendingEntry entry;
                 grpc::ClientContext context;
                 PutResponse response;
@@ -769,14 +894,15 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             uint64_t failed = 0;
             auto rpc_deadline = std::chrono::system_clock::now() + std::chrono::seconds(30);
             auto bench_start = std::chrono::steady_clock::now();
+            std::vector<uint64_t> issued_by_node(membership->members.size(), 0);
             for (uint64_t i = 0; i < count; ++i) {
-                int index = SelectWriteNodeIndex(*membership, workload[i].first);
+                int index = workload[i].target_index;
                 if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
                     failed += 1;
                     if (failed <= 10) {
                         std::cout << "bench route error: mode=" << membership->mode
                                   << " epoch=" << membership->epoch
-                                  << " key=" << workload[i].first
+                                  << " key=" << workload[i].key
                                   << " selected_index=" << index
                                   << " members=" << membership->members.size() << std::endl;
                     }
@@ -785,14 +911,15 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
 
                 auto call = std::make_unique<AsyncPutCall>();
                 call->index = i;
-                call->key = workload[i].first;
+                call->key = workload[i].key;
+                call->target_index = index;
                 call->entry = PendingEntry{std::chrono::steady_clock::now(), benchmark_id};
                 call->context.set_deadline(rpc_deadline);
 
                 PutRequest request;
                 request.set_request_id((*request_id)++);
-                request.set_key(workload[i].first);
-                request.set_value(workload[i].second);
+                request.set_key(workload[i].key);
+                request.set_value(workload[i].value);
                 request.set_version(0);
                 request.set_client_addr(listen_addr);
 
@@ -801,6 +928,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     &call->context, request, &completion_queue);
                 call->rpc->StartCall();
                 call->rpc->Finish(&call->response, &call->status, tag);
+                issued_by_node[index] += 1;
                 calls.push_back(std::move(call));
             }
 
@@ -821,9 +949,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                             std::cout << ": " << call->status.error_message();
                         }
                         std::cout << " target="
-                                  << MemberAddressAt(*membership,
-                                                     SelectWriteNodeIndex(*membership,
-                                                                         call->key))
+                                  << MemberAddressAt(*membership, call->target_index)
                                   << " mode=" << membership->mode
                                   << " epoch=" << membership->epoch;
                         std::cout << std::endl;
@@ -835,6 +961,8 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 accepted += 1;
             }
             completion_queue.Shutdown();
+            PrintTargetCounts("issued writes by target node", *membership,
+                              issued_by_node, "writes");
 
             // Wait for CommitAcks, but bail out if no progress is made for a
             // while. Without this, a single orphaned write (e.g. the original

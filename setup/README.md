@@ -63,7 +63,7 @@ get a
 use CHAIN
 use CRAQ
 use CROWN
-bench 100 key value
+bench 50000 setup/generated_kv_dataset/all_kv_pairs.csv
 quit
 ```
 
@@ -71,6 +71,7 @@ Generate a balanced KV file or a hot-key workload file:
 
 ```bash
 python setup/generate_kv_dataset.py --total-pairs 20000
+python setup/generate_kv_dataset.py --total-pairs 50000 --nodes 3
 python setup/generate_kv_dataset.py --total-pairs 20000 --hot-share 20
 python setup/generate_kv_dataset.py --total-pairs 20000 --hot-share 40
 python setup/generate_kv_dataset.py --total-pairs 20000 --hot-share 60
@@ -80,9 +81,13 @@ python setup/generate_kv_dataset.py --total-pairs 20000 --file-name hot_20.csv -
 
 `--hot-share` controls what percentage of the rows are drawn from the hot key set.
 `--hot-set-share` controls how many of the unique keys belong to that hot set.
+`--nodes` balances and prints the expected key-to-head distribution for that ring size.
 `--file-name` writes into `setup/generated_kv_dataset/` using just the filename.
 `--output-file` still accepts a full custom path.
 The default output file is `setup/generated_kv_dataset/all_kv_pairs.csv`.
+
+The benchmark precomputes each key's target node before timing begins, then
+prints how many writes it issued to each target node.
 
 ## Restart / Stop
 

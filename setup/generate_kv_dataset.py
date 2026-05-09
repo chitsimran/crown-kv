@@ -20,7 +20,7 @@ import math
 import string
 from collections import deque
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
 
 FNV_OFFSET_BASIS = 14695981039346656037
@@ -142,6 +142,22 @@ def write_dataset_csv(path: Path, rows: List[Tuple[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def head_distribution(rows: Iterable[Tuple[str, str]], nodes: int) -> List[int]:
+    counts = [0] * nodes
+    for key, _ in rows:
+        counts[fnv1a_64(key) % nodes] += 1
+    return counts
+
+
+def print_head_distribution(rows: List[Tuple[str, str]], nodes: int) -> None:
+    counts = head_distribution(rows, nodes)
+    spread = max(counts) - min(counts) if counts else 0
+    rendered = ", ".join(
+        f"node {index}: {count}" for index, count in enumerate(counts)
+    )
+    print(f"Head distribution for {nodes} nodes: {rendered} (spread={spread})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a balanced KV dataset")
     parser.add_argument(
@@ -188,6 +204,8 @@ def main() -> int:
         raise SystemExit("--hot-share must be between 0 and 100")
     if not 1 <= args.hot_set_share <= 100:
         raise SystemExit("--hot-set-share must be between 1 and 100")
+    if args.nodes is not None and args.nodes <= 0:
+        raise SystemExit("--nodes must be greater than zero")
 
     output_file = args.output_file
     if args.file_name:
@@ -199,9 +217,31 @@ def main() -> int:
     write_dataset_csv(output_file, rows)
 
     print(f"Wrote {len(rows)} pairs to {output_file}")
-    print("Balanced for ring sizes 3, 5, 7, and 9 using the repo's FNV-1a hash.")
+    if args.nodes is not None:
+        if args.hot_share > 0:
+            print(
+                f"Base key generation is balanced for ring size {args.nodes}; "
+                "the written CSV below includes the requested hot-key skew."
+            )
+        else:
+            print(f"Balanced for ring size {args.nodes} using the repo's FNV-1a hash.")
+        print_head_distribution(rows, args.nodes)
+    else:
+        if args.hot_share > 0:
+            print(
+                "Base key generation is balanced for ring sizes 3, 5, 7, and 9; "
+                "the written CSV below includes the requested hot-key skew."
+            )
+        else:
+            print("Balanced for ring sizes 3, 5, 7, and 9 using the repo's FNV-1a hash.")
+        for nodes in (3, 5, 7, 9):
+            print_head_distribution(rows, nodes)
     if args.hot_share > 0:
-        print(f"Hot rows: {args.hot_share}% of the file, hot set: {args.hot_set_share}% of keys")
+        print(
+            "Hot rows intentionally skew the written CSV: "
+            f"{args.hot_share}% of rows target the hot set, "
+            f"hot set: {args.hot_set_share}% of keys"
+        )
     return 0
 
 
