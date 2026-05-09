@@ -202,6 +202,7 @@ public:
             metadata_client_->SendSyncComplete(node_id, request->epoch());
         }
         chain_replication_->update_membership(membership_copy, node_id);
+        chain_replication_->set_epoch(request->epoch());
         craq_replication_->update_membership(membership_copy, node_id);
         craq_replication_->set_epoch(request->epoch());
         crown_replication_->update_membership(membership_copy, node_id);
@@ -680,6 +681,7 @@ private:
             node_id = state_->node_id;
         }
         chain_replication_->update_membership(membership_copy, node_id);
+        chain_replication_->set_epoch(membership_response.epoch());
         craq_replication_->update_membership(membership_copy, node_id);
         craq_replication_->set_epoch(membership_response.epoch());
         crown_replication_->update_membership(membership_copy, node_id);
@@ -731,6 +733,7 @@ void RefreshMembership(ServerState* state, MetadataClient* client,
         node_id = state->node_id;
     }
     chain_replication->update_membership(membership_copy, node_id);
+    chain_replication->set_epoch(response.epoch());
     craq_replication->update_membership(membership_copy, node_id);
     craq_replication->set_epoch(response.epoch());
     crown_replication->update_membership(membership_copy, node_id);

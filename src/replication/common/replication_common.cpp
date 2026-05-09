@@ -96,6 +96,7 @@ void Replication::forward_put(PutRequest request,
     if (!next_stub) {
         return;
     }
+    request.set_epoch(epoch_.load());
     add_to_pending_acks(request);
 
     std::shared_ptr<ReplicationService::Stub> stub = next_stub;

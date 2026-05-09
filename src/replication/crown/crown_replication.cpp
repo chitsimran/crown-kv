@@ -52,10 +52,6 @@ std::optional<Record> CrownReplication::get_dirty_record(const std::string& key,
     return rec_it->second;
 }
 
-void CrownReplication::set_epoch(uint64_t epoch) {
-    epoch_.store(epoch);
-}
-
 void CrownReplication::update_membership(const std::vector<NodeInfo>& membership,
                                          const std::string& node_id) {
     int ring_size = static_cast<int>(membership.size());

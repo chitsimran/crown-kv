@@ -54,6 +54,8 @@ public:
     // if prev_stub is null, send ack to the client (source_ip in the request), else send ack to the prev node
     void send_ack(int64_t request_id, const std::shared_ptr<ReplicationService::Stub>& prev_stub);
 
+    void set_epoch(uint64_t epoch) { epoch_.store(epoch); }
+
     virtual PutResponse handle_put(PutRequest request) = 0;
 
     // in case of craq and crown check with Tail the latest version if you have a dirty version
@@ -62,6 +64,9 @@ public:
     virtual void handle_ack(int64_t request_id) = 0;
 
     virtual std::shared_ptr<ReplicationService::Stub> get_next_stub() = 0;
+
+protected:
+    std::atomic<uint64_t> epoch_{0};
 
 private:
     struct ForwardTask {

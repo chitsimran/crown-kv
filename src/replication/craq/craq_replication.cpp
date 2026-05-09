@@ -52,10 +52,6 @@ std::optional<Record> CraqReplication::get_dirty_record(const std::string& key,
     return rec_it->second;
 }
 
-void CraqReplication::set_epoch(uint64_t epoch) {
-    epoch_.store(epoch);
-}
-
 void CraqReplication::update_membership(const std::vector<NodeInfo>& membership,
                                         const std::string& node_id) {
     int ring_size = static_cast<int>(membership.size());
