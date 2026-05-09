@@ -19,11 +19,14 @@ run_as_root() {
 
 have_required_tools() {
     local missing=0
-    for tool in git cmake make g++ tmux pkg-config protoc grpc_cpp_plugin; do
+    for tool in git cmake make g++ tmux pkg-config protoc grpc_cpp_plugin python3; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing=1
         fi
     done
+    if ! python3 -c 'import matplotlib' >/dev/null 2>&1; then
+        missing=1
+    fi
     return "$missing"
 }
 
@@ -59,12 +62,14 @@ if command -v apt-get >/dev/null 2>&1; then
     run_as_root apt-get update -y
     run_as_root apt-get install -y \
         git cmake make g++ rsync openssh-client wget vim tmux pkg-config \
-        libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
+        libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+        python3 python3-matplotlib
 elif command -v dnf >/dev/null 2>&1; then
     ensure_sudo
     run_as_root dnf install -y \
         git cmake make gcc-c++ rsync openssh-clients wget vim tmux pkgconf-pkg-config \
-        grpc-devel protobuf-devel protobuf-compiler
+        grpc-devel protobuf-devel protobuf-compiler \
+        python3 python3-matplotlib
 else
     echo "ERROR: no supported package manager found; expected apt-get or dnf."
     exit 1

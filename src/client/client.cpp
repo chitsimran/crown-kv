@@ -1,4 +1,5 @@
 #include "replication.grpc.pb.h"
+#include "client/throughput_window.h"
 #include "replication/common/replication_common.h"
 #include <grpcpp/grpcpp.h>
 
@@ -6,12 +7,17 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -50,6 +56,14 @@ struct PendingKeyHash {
 
 struct PendingEntry {
     std::chrono::steady_clock::time_point sent;
+    uint64_t benchmark_id = 0;
+};
+
+struct CommitEvent {
+    std::chrono::steady_clock::time_point committed_at;
+    double latency_ms = 0.0;
+    uint64_t completed_sequence = 0;
+    uint64_t benchmark_id = 0;
 };
 
 struct ClientState {
@@ -63,7 +77,20 @@ struct ClientState {
     double total_latency_ms = 0.0;
     bool started = false;
     std::chrono::steady_clock::time_point start_time;
+    uint64_t next_benchmark_id = 1;
+    std::vector<CommitEvent> commit_events;
 };
+
+void RecordCommitLocked(ClientState* state, const PendingEntry& entry,
+                        std::chrono::steady_clock::time_point committed_at) {
+    auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+        committed_at - entry.sent);
+    double latency_ms = latency.count() / 1000.0;
+    state->total_latency_ms += latency_ms;
+    state->completed += 1;
+    state->commit_events.push_back(
+        CommitEvent{committed_at, latency_ms, state->completed, entry.benchmark_id});
+}
 
 class CommitAckServiceImpl final : public ClientAckService::Service {
 public:
@@ -76,14 +103,9 @@ public:
         PendingKey key{request->key(), request->version()};
         auto it = state_->pending.find(key);
         if (it != state_->pending.end()) {
-            auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
-                now - it->second.sent);
-            state_->total_latency_ms += latency.count() / 1000.0;
-            state_->completed += 1;
+            RecordCommitLocked(state_, it->second, now);
             state_->pending.erase(it);
-            if (state_->completed >= state_->expected) {
-                state_->cv.notify_all();
-            }
+            state_->cv.notify_all();
         } else {
             state_->committed_early[key] = now;
         }
@@ -290,12 +312,13 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [csv] [hot%] [hot-set%]\n"
+        << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix]\n"
         << "                             Single-threaded async open-loop writes from a\n"
         << "                             CSV produced by setup/generate_kv_dataset.py.\n"
         << "                             hot% is the share of writes targeting hot keys;\n"
         << "                             hot-set% is the share of unique keys in the hot\n"
-        << "                             pool. The dataset is loaded once and cached.\n"
+        << "                             pool. window-ms defaults to 500. Throughput CSV\n"
+        << "                             and PNG default to bench_results/throughput_*.{csv,png}.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -340,11 +363,8 @@ void RecordAcceptedWrite(ClientState* state, const PendingKey& pending_key,
     state->expected += 1;
     auto early_it = state->committed_early.find(pending_key);
     if (early_it != state->committed_early.end()) {
-        auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
-            early_it->second - entry.sent);
-        state->total_latency_ms += latency.count() / 1000.0;
+        RecordCommitLocked(state, entry, early_it->second);
         state->committed_early.erase(early_it);
-        state->completed += 1;
         state->cv.notify_all();
         return;
     }
@@ -427,6 +447,139 @@ std::vector<std::pair<std::string, std::string>> BuildSkewedWorkload(
         }
     }
     return workload;
+}
+
+uint64_t CountBenchmarkCommitsLocked(const ClientState* state, uint64_t benchmark_id,
+                                     size_t first_event_index) {
+    uint64_t count = 0;
+    for (size_t i = first_event_index; i < state->commit_events.size(); ++i) {
+        if (state->commit_events[i].benchmark_id == benchmark_id) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+std::vector<benchmark::CommitSample> SnapshotBenchmarkSamples(
+    ClientState* state, uint64_t benchmark_id, size_t first_event_index,
+    std::chrono::steady_clock::time_point bench_start) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    std::vector<benchmark::CommitSample> samples;
+    for (size_t i = first_event_index; i < state->commit_events.size(); ++i) {
+        const auto& event = state->commit_events[i];
+        if (event.benchmark_id != benchmark_id) {
+            continue;
+        }
+        benchmark::CommitSample sample;
+        sample.time_sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+            event.committed_at - bench_start).count();
+        if (sample.time_sec < 0.0) {
+            sample.time_sec = 0.0;
+        }
+        sample.latency_ms = event.latency_ms;
+        sample.completed_sequence = event.completed_sequence;
+        samples.push_back(sample);
+    }
+    return samples;
+}
+
+std::string TimestampForFilename() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm* tm = std::localtime(&now_time);
+    if (!tm) {
+        return "unknown_time";
+    }
+    std::ostringstream out;
+    out << std::put_time(tm, "%Y%m%d_%H%M%S");
+    return out.str();
+}
+
+std::pair<std::filesystem::path, std::filesystem::path> BenchmarkOutputPaths(
+    const std::string& output_prefix) {
+    std::filesystem::path prefix;
+    if (output_prefix.empty()) {
+        prefix = std::filesystem::path("bench_results") /
+                 ("throughput_" + TimestampForFilename());
+    } else {
+        prefix = output_prefix;
+    }
+
+    std::filesystem::path csv_path = prefix;
+    std::filesystem::path png_path = prefix;
+    if (csv_path.extension() == ".csv") {
+        png_path.replace_extension(".png");
+    } else {
+        csv_path += ".csv";
+        png_path += ".png";
+    }
+    return {csv_path, png_path};
+}
+
+bool WriteThroughputCsv(const std::filesystem::path& csv_path,
+                        const std::vector<benchmark::ThroughputWindowRow>& rows) {
+    std::error_code ec;
+    auto parent = csv_path.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            std::cerr << "failed to create benchmark output directory "
+                      << parent.string() << ": " << ec.message() << std::endl;
+            return false;
+        }
+    }
+
+    std::ofstream out(csv_path);
+    if (!out.is_open()) {
+        std::cerr << "failed to write throughput CSV: " << csv_path.string() << std::endl;
+        return false;
+    }
+
+    out << "time_sec,window_start_sec,window_end_sec,commits,throughput_ops_sec,"
+           "cumulative_commits,failed,accepted,orphaned\n";
+    out << std::fixed << std::setprecision(6);
+    for (const auto& row : rows) {
+        out << row.time_sec << ','
+            << row.window_start_sec << ','
+            << row.window_end_sec << ','
+            << row.commits << ','
+            << row.throughput_ops_sec << ','
+            << row.cumulative_commits << ','
+            << row.failed << ','
+            << row.accepted << ','
+            << row.orphaned << '\n';
+    }
+    return true;
+}
+
+std::string ShellQuote(const std::string& value) {
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+void TryPlotThroughputCsv(const std::filesystem::path& csv_path,
+                          const std::filesystem::path& png_path) {
+    std::string command = "python3 setup/plot_throughput.py " +
+                          ShellQuote(csv_path.string()) + " " +
+                          ShellQuote(png_path.string());
+    int rc = std::system(command.c_str());
+    if (rc == 0) {
+        std::cout << "throughput plot: " << png_path.string() << std::endl;
+        return;
+    }
+    std::cout << "throughput plot skipped; CSV is available at "
+              << csv_path.string()
+              << " (run `python3 setup/plot_throughput.py "
+              << csv_path.string() << " " << png_path.string()
+              << "` after installing matplotlib)" << std::endl;
 }
 
 void PrintClientStats(ClientState* state) {
@@ -525,10 +678,12 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
         } else if (command == "bench") {
             if (words.size() < 2) {
-                std::cout << "usage: bench N [csv-path] [hot-share%] [hot-set-share%]\n"
+                std::cout << "usage: bench N [csv-path] [hot-share%] [hot-set-share%] [window-ms] [output-prefix]\n"
                           << "  csv-path     defaults to setup/generated_kv_dataset/all_kv_pairs.csv\n"
                           << "  hot-share    0-100, percentage of writes targeting hot keys (default 0)\n"
-                          << "  hot-set-share 1-100, percentage of unique keys in the hot pool (default 10)"
+                          << "  hot-set-share 1-100, percentage of unique keys in the hot pool (default 10)\n"
+                          << "  window-ms    sliding throughput window in milliseconds (default 500)\n"
+                          << "  output-prefix defaults to bench_results/throughput_<timestamp>"
                           << std::endl;
                 continue;
             }
@@ -538,12 +693,18 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 : std::string("setup/generated_kv_dataset/all_kv_pairs.csv");
             int hot_share = words.size() >= 4 ? std::stoi(words[3]) : 0;
             int hot_set_share = words.size() >= 5 ? std::stoi(words[4]) : 10;
+            int window_ms = words.size() >= 6 ? std::stoi(words[5]) : 500;
+            std::string output_prefix = words.size() >= 7 ? words[6] : "";
             if (hot_share < 0 || hot_share > 100) {
                 std::cout << "hot-share must be 0-100" << std::endl;
                 continue;
             }
             if (hot_set_share < 1 || hot_set_share > 100) {
                 std::cout << "hot-set-share must be 1-100" << std::endl;
+                continue;
+            }
+            if (window_ms <= 0) {
+                std::cout << "window-ms must be positive" << std::endl;
                 continue;
             }
 
@@ -583,11 +744,13 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                       << " hot_set_share=" << hot_set_share << "%"
                       << " (" << build_ms << " ms)" << std::endl;
 
-            uint64_t start_completed = 0;
+            uint64_t benchmark_id = 0;
+            size_t first_commit_event = 0;
             uint64_t accepted = 0;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
-                start_completed = state->completed;
+                benchmark_id = state->next_benchmark_id++;
+                first_commit_event = state->commit_events.size();
             }
 
             struct AsyncPutCall {
@@ -623,7 +786,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 auto call = std::make_unique<AsyncPutCall>();
                 call->index = i;
                 call->key = workload[i].first;
-                call->entry = PendingEntry{std::chrono::steady_clock::now()};
+                call->entry = PendingEntry{std::chrono::steady_clock::now(), benchmark_id};
                 call->context.set_deadline(rpc_deadline);
 
                 PutRequest request;
@@ -682,16 +845,14 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             uint64_t orphaned = 0;
             auto last_progress = std::chrono::steady_clock::now();
             uint64_t last_seen = 0;
-            {
-                std::lock_guard<std::mutex> lg(state->mutex);
-                last_seen = state->completed;
-            }
             while (true) {
                 std::unique_lock<std::mutex> lock(state->mutex);
                 bool met = state->cv.wait_for(lock, kProgressTick, [&]() {
-                    return state->completed >= start_completed + accepted;
+                    return CountBenchmarkCommitsLocked(state, benchmark_id,
+                                                       first_commit_event) >= accepted;
                 });
-                uint64_t completed_now = state->completed;
+                uint64_t completed_now = CountBenchmarkCommitsLocked(
+                    state, benchmark_id, first_commit_event);
                 lock.unlock();
                 if (met) {
                     break;
@@ -702,9 +863,11 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     last_progress = now;
                 }
                 auto stalled = now - last_progress;
-                uint64_t outstanding = (start_completed + accepted) - completed_now;
+                uint64_t outstanding = accepted > completed_now
+                    ? accepted - completed_now
+                    : 0;
                 std::cout << "bench wait: completed="
-                          << (completed_now - start_completed)
+                          << completed_now
                           << "/" << accepted
                           << " outstanding=" << outstanding
                           << " stalled_for="
@@ -721,9 +884,26 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
             auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
                 std::chrono::steady_clock::now() - bench_start);
-            uint64_t committed = accepted - orphaned;
-            std::cout << "committed " << committed << " writes in " << elapsed.count()
-                      << "s (" << (committed / elapsed.count()) << " ops/sec)"
+            auto samples = SnapshotBenchmarkSamples(state, benchmark_id,
+                                                     first_commit_event, bench_start);
+            uint64_t committed = static_cast<uint64_t>(samples.size());
+            orphaned = accepted > committed ? accepted - committed : 0;
+            double last_commit_sec = 0.0;
+            for (const auto& sample : samples) {
+                last_commit_sec = std::max(last_commit_sec, sample.time_sec);
+            }
+            double throughput = last_commit_sec > 0.0 ? committed / last_commit_sec : 0.0;
+            double window_sec = window_ms / 1000.0;
+            auto rows = benchmark::BuildThroughputWindows(
+                samples, last_commit_sec, window_sec, failed, accepted, orphaned);
+            auto [csv_output_path, png_output_path] = BenchmarkOutputPaths(output_prefix);
+            if (WriteThroughputCsv(csv_output_path, rows)) {
+                std::cout << "throughput csv: " << csv_output_path.string() << std::endl;
+                TryPlotThroughputCsv(csv_output_path, png_output_path);
+            }
+            std::cout << "committed " << committed << " writes in active "
+                      << last_commit_sec << "s (" << throughput << " ops/sec)"
+                      << ", wall " << elapsed.count() << "s"
                       << ", failed " << failed
                       << ", orphaned " << orphaned
                       << ", async single-threaded" << std::endl;
