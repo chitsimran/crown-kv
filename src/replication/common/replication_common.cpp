@@ -3,7 +3,6 @@
 
 #include <grpcpp/grpcpp.h>
 #include <algorithm>
-#include <thread>
 
 using replication::CommitAck;
 using replication::CommitAckResponse;
@@ -14,8 +13,32 @@ using replication::WriteAckResponse;
 namespace {
 
 constexpr auto kAckTimeout = std::chrono::milliseconds(5000);
+constexpr size_t kForwardWorkerCount = 16;
+constexpr size_t kMaxForwardQueueSize = 100000;
 
 } // namespace
+
+Replication::Replication() {
+    forward_workers_.reserve(kForwardWorkerCount);
+    for (size_t i = 0; i < kForwardWorkerCount; ++i) {
+        forward_workers_.emplace_back([this]() {
+            forward_worker_loop();
+        });
+    }
+}
+
+Replication::~Replication() {
+    {
+        std::lock_guard<std::mutex> lock(forward_mutex_);
+        forward_shutdown_ = true;
+    }
+    forward_cv_.notify_all();
+    for (auto& worker : forward_workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
 
 void Replication::add_to_pending_acks(PutRequest request) {
     std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -77,15 +100,47 @@ void Replication::forward_put(PutRequest request,
 
     std::shared_ptr<ReplicationService::Stub> stub = next_stub;
     auto failure_handler = forward_failure_handler;
-    std::thread([stub, request, failure_handler]() mutable {
+    enqueue_forward_task(ForwardTask{request, stub, failure_handler});
+}
+
+void Replication::enqueue_forward_task(ForwardTask task) {
+    {
+        std::unique_lock<std::mutex> lock(forward_mutex_);
+        forward_cv_.wait(lock, [this]() {
+            return forward_shutdown_ || forward_queue_.size() < kMaxForwardQueueSize;
+        });
+        if (forward_shutdown_) {
+            return;
+        }
+        forward_queue_.push_back(std::move(task));
+    }
+    forward_cv_.notify_one();
+}
+
+void Replication::forward_worker_loop() {
+    while (true) {
+        ForwardTask task;
+        {
+            std::unique_lock<std::mutex> lock(forward_mutex_);
+            forward_cv_.wait(lock, [this]() {
+                return forward_shutdown_ || !forward_queue_.empty();
+            });
+            if (forward_shutdown_ && forward_queue_.empty()) {
+                return;
+            }
+            task = std::move(forward_queue_.front());
+            forward_queue_.pop_front();
+        }
+        forward_cv_.notify_one();
+
         grpc::ClientContext context;
         context.set_deadline(std::chrono::system_clock::now() + kAckTimeout);
         PutResponse response;
-        grpc::Status status = stub->ForwardPut(&context, request, &response);
-        if ((!status.ok() || !response.success()) && failure_handler) {
-            failure_handler(request);
+        grpc::Status status = task.stub->ForwardPut(&context, task.request, &response);
+        if ((!status.ok() || !response.success()) && task.failure_handler) {
+            task.failure_handler(task.request);
         }
-    }).detach();
+    }
 }
 
 void Replication::send_ack(int64_t request_id,

@@ -5,8 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -250,7 +250,7 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [key] [value] [workers]  Open-loop writes, e.g. bench 100 k v 128\n"
+        << "  bench N [key] [value]      Single-threaded async open-loop writes\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -409,16 +409,12 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
         } else if (command == "bench") {
             if (words.size() < 2) {
-                std::cout << "usage: bench N [key-prefix] [value-prefix] [workers]" << std::endl;
+                std::cout << "usage: bench N [key-prefix] [value-prefix]" << std::endl;
                 continue;
             }
             uint64_t count = std::stoull(words[1]);
             std::string key_prefix = words.size() >= 3 ? words[2] : "key";
             std::string value_prefix = words.size() >= 4 ? words[3] : "value";
-            size_t worker_count = words.size() >= 5 ? std::stoull(words[4]) : 128;
-            if (worker_count == 0) {
-                worker_count = 1;
-            }
             uint64_t start_completed = 0;
             uint64_t accepted = 0;
             {
@@ -426,11 +422,14 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 start_completed = state->completed;
             }
 
-            struct BenchTask {
+            struct AsyncPutCall {
                 uint64_t index = 0;
                 std::string key;
-                std::string value;
                 PendingEntry entry;
+                grpc::ClientContext context;
+                PutResponse response;
+                grpc::Status status;
+                std::unique_ptr<grpc::ClientAsyncResponseReader<PutResponse>> rpc;
             };
 
             std::vector<std::pair<std::string, std::string>> workload;
@@ -440,78 +439,64 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                                       value_prefix + std::to_string(i));
             }
 
-            std::mutex queue_mutex;
-            std::condition_variable queue_cv;
-            std::deque<BenchTask> queue;
-            bool enqueue_done = false;
-            std::atomic<uint64_t> accepted_atomic{0};
-            std::atomic<uint64_t> failed_atomic{0};
-            std::mutex output_mutex;
-
-            auto worker = [&]() {
-                MembershipState local_membership = *membership;
-                while (true) {
-                    BenchTask task;
-                    {
-                        std::unique_lock<std::mutex> lock(queue_mutex);
-                        queue_cv.wait(lock, [&]() {
-                            return enqueue_done || !queue.empty();
-                        });
-                        if (queue.empty()) {
-                            if (enqueue_done) {
-                                return;
-                            }
-                            continue;
-                        }
-                        task = std::move(queue.front());
-                        queue.pop_front();
-                    }
-
-                    PutResponse response;
-                    if (!SendPutWithRetry(task.key, task.value, listen_addr, request_id,
-                                          metadata_stub, &local_membership, &response) ||
-                        !response.success()) {
-                        failed_atomic.fetch_add(1);
-                        if (failed_atomic.load() <= 10) {
-                            std::lock_guard<std::mutex> lock(output_mutex);
-                            std::cout << "put failed at " << task.index << std::endl;
-                        }
-                        continue;
-                    }
-                    RecordAcceptedWrite(state, PendingKey{task.key, response.version()},
-                                        task.entry);
-                    accepted_atomic.fetch_add(1);
-                }
-            };
-
-            std::vector<std::thread> workers;
-            workers.reserve(worker_count);
-            for (size_t i = 0; i < worker_count; ++i) {
-                workers.emplace_back(worker);
-            }
-
+            grpc::CompletionQueue completion_queue;
+            std::vector<std::unique_ptr<AsyncPutCall>> calls;
+            calls.reserve(count);
+            uint64_t failed = 0;
             auto bench_start = std::chrono::steady_clock::now();
             for (uint64_t i = 0; i < count; ++i) {
-                BenchTask task;
-                task.index = i;
-                task.key = workload[i].first;
-                task.value = workload[i].second;
-                task.entry = PendingEntry{std::chrono::steady_clock::now()};
-                {
-                    std::lock_guard<std::mutex> lock(queue_mutex);
-                    queue.push_back(std::move(task));
+                int index = SelectWriteNodeIndex(*membership, workload[i].first);
+                if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
+                    failed += 1;
+                    continue;
                 }
-                queue_cv.notify_one();
+
+                auto call = std::make_unique<AsyncPutCall>();
+                call->index = i;
+                call->key = workload[i].first;
+                call->entry = PendingEntry{std::chrono::steady_clock::now()};
+
+                PutRequest request;
+                request.set_request_id((*request_id)++);
+                request.set_key(workload[i].first);
+                request.set_value(workload[i].second);
+                request.set_version(0);
+                request.set_client_addr(listen_addr);
+                request.set_epoch(membership->epoch);
+
+                auto* tag = call.get();
+                call->rpc = membership->stubs[index]->AsyncPut(&call->context, request,
+                                                               &completion_queue);
+                call->rpc->Finish(&call->response, &call->status, tag);
+                calls.push_back(std::move(call));
             }
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex);
-                enqueue_done = true;
+
+            void* tag = nullptr;
+            bool ok = false;
+            uint64_t completed_acceptances = 0;
+            while (completed_acceptances < calls.size() &&
+                   completion_queue.Next(&tag, &ok)) {
+                completed_acceptances += 1;
+                auto* call = static_cast<AsyncPutCall*>(tag);
+                if (!ok || !call->status.ok() || !call->response.success()) {
+                    failed += 1;
+                    if (failed <= 10) {
+                        std::cout << "put failed at " << call->index;
+                        if (!call->response.error().empty()) {
+                            std::cout << ": " << call->response.error();
+                        } else if (!call->status.ok()) {
+                            std::cout << ": " << call->status.error_message();
+                        }
+                        std::cout << std::endl;
+                    }
+                    continue;
+                }
+                RecordAcceptedWrite(state, PendingKey{call->key, call->response.version()},
+                                    call->entry);
+                accepted += 1;
             }
-            queue_cv.notify_all();
-            for (auto& thread : workers) {
-                thread.join();
-            }
-            accepted = accepted_atomic.load();
+            completion_queue.Shutdown();
+
             {
                 std::unique_lock<std::mutex> lock(state->mutex);
                 state->cv.wait(lock, [&]() {
@@ -522,8 +507,8 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::chrono::steady_clock::now() - bench_start);
             std::cout << "committed " << accepted << " writes in " << elapsed.count()
                       << "s (" << (accepted / elapsed.count()) << " ops/sec)"
-                      << ", failed " << failed_atomic.load()
-                      << ", workers " << worker_count << std::endl;
+                      << ", failed " << failed
+                      << ", async single-threaded" << std::endl;
         } else if (command == "pending") {
             PrintClientStats(state);
         } else {

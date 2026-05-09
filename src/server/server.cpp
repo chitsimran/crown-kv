@@ -218,9 +218,7 @@ private:
         InflightRequest inflight;
         inflight.set_origin_node_id(state_->node_id);
         inflight.set_epoch(epoch);
-        std::thread([this, inflight]() {
-            SendOriginInflight(inflight);
-        }).detach();
+        SendOriginInflight(inflight);
     }
 
     void SyncFromPeer(const std::vector<NodeInfo>& membership,
@@ -461,10 +459,7 @@ public:
             return grpc::Status::OK;
         }
 
-        InflightRequest inflight = *request;
-        std::thread([this, replication, inflight]() {
-            HandleInflight(replication, inflight);
-        }).detach();
+        HandleInflight(replication, *request);
         return grpc::Status::OK;
     }
 
@@ -588,31 +583,29 @@ private:
     }
 
     void RefreshMembershipAsync() {
-        std::thread([this]() {
-            MembershipResponse membership_response;
-            if (!metadata_client_->GetMembership(&membership_response)) {
+        MembershipResponse membership_response;
+        if (!metadata_client_->GetMembership(&membership_response)) {
+            return;
+        }
+        std::vector<NodeInfo> membership_copy;
+        std::string node_id;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (membership_response.epoch() < state_->epoch) {
                 return;
             }
-            std::vector<NodeInfo> membership_copy;
-            std::string node_id;
-            {
-                std::lock_guard<std::mutex> lock(state_->mutex);
-                if (membership_response.epoch() < state_->epoch) {
-                    return;
-                }
-                state_->epoch = membership_response.epoch();
-                state_->mode = membership_response.mode();
-                state_->membership.assign(membership_response.membership().begin(),
-                                          membership_response.membership().end());
-                membership_copy = state_->membership;
-                node_id = state_->node_id;
-            }
-            chain_replication_->update_membership(membership_copy, node_id);
-            craq_replication_->update_membership(membership_copy, node_id);
-            craq_replication_->set_epoch(membership_response.epoch());
-            crown_replication_->update_membership(membership_copy, node_id);
-            crown_replication_->set_epoch(membership_response.epoch());
-        }).detach();
+            state_->epoch = membership_response.epoch();
+            state_->mode = membership_response.mode();
+            state_->membership.assign(membership_response.membership().begin(),
+                                      membership_response.membership().end());
+            membership_copy = state_->membership;
+            node_id = state_->node_id;
+        }
+        chain_replication_->update_membership(membership_copy, node_id);
+        craq_replication_->update_membership(membership_copy, node_id);
+        craq_replication_->set_epoch(membership_response.epoch());
+        crown_replication_->update_membership(membership_copy, node_id);
+        crown_replication_->set_epoch(membership_response.epoch());
     }
 
     ServerState* state_;

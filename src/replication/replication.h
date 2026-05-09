@@ -4,10 +4,13 @@
 #include "replication.grpc.pb.h"
 #include "../kv_store/kv_store.h"
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +21,9 @@ using replication::ReplicationService;
 
 class Replication {
 public:
+    Replication();
+    virtual ~Replication();
+
     struct PendingEntry {
         PutRequest request;
         std::chrono::steady_clock::time_point deadline;
@@ -56,4 +62,20 @@ public:
     virtual void handle_ack(int64_t request_id) = 0;
 
     virtual std::shared_ptr<ReplicationService::Stub> get_next_stub() = 0;
+
+private:
+    struct ForwardTask {
+        PutRequest request;
+        std::shared_ptr<ReplicationService::Stub> stub;
+        std::function<void(const PutRequest&)> failure_handler;
+    };
+
+    void enqueue_forward_task(ForwardTask task);
+    void forward_worker_loop();
+
+    std::mutex forward_mutex_;
+    std::condition_variable forward_cv_;
+    std::deque<ForwardTask> forward_queue_;
+    std::vector<std::thread> forward_workers_;
+    bool forward_shutdown_ = false;
 };
