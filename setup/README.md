@@ -67,6 +67,23 @@ bench 100 key value
 quit
 ```
 
+Generate a balanced KV file or a hot-key workload file:
+
+```bash
+python setup/generate_kv_dataset.py --total-pairs 20000
+python setup/generate_kv_dataset.py --total-pairs 20000 --hot-share 20
+python setup/generate_kv_dataset.py --total-pairs 20000 --hot-share 40
+python setup/generate_kv_dataset.py --total-pairs 20000 --hot-share 60
+python setup/generate_kv_dataset.py --total-pairs 20000 --hot-share 80
+python setup/generate_kv_dataset.py --total-pairs 20000 --file-name hot_20.csv --hot-share 20
+```
+
+`--hot-share` controls what percentage of the rows are drawn from the hot key set.
+`--hot-set-share` controls how many of the unique keys belong to that hot set.
+`--file-name` writes into `setup/generated_kv_dataset/` using just the filename.
+`--output-file` still accepts a full custom path.
+The default output file is `setup/generated_kv_dataset/all_kv_pairs.csv`.
+
 ## Restart / Stop
 
 ```bash
