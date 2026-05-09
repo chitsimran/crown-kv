@@ -469,7 +469,7 @@ int main(int argc, char** argv) {
     server->Wait();
 
     shutdown_flag.store(true);
-    monitor_thread.join();
+    // monitor_thread.join();
     if (add_thread.joinable()) {
         add_thread.join();
     }
