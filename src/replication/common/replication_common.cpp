@@ -138,7 +138,7 @@ void Replication::forward_worker_loop() {
         context.set_deadline(std::chrono::system_clock::now() + kAckTimeout);
         PutResponse response;
         grpc::Status status = task.stub->ForwardPut(&context, task.request, &response);
-        if ((!status.ok() || !response.success()) && task.failure_handler) {
+        if (!status.ok() && task.failure_handler) {
             task.failure_handler(task.request);
         }
     }
