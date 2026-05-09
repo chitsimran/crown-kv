@@ -100,6 +100,23 @@ struct MembershipState {
     std::vector<std::shared_ptr<ReplicationService::Stub>> stubs;
 };
 
+std::string MemberAddressAt(const MembershipState& membership, int index) {
+    if (index < 0 || index >= static_cast<int>(membership.members.size())) {
+        return "<invalid>";
+    }
+    return replication_common::address_from_node(membership.members[index]);
+}
+
+void PrintRouteDebug(const std::string& op, const MembershipState& membership,
+                     const std::string& key, int index, int attempt) {
+    std::cout << op << " route: mode=" << membership.mode
+              << " epoch=" << membership.epoch
+              << " key=" << key
+              << " index=" << index
+              << " target=" << MemberAddressAt(membership, index)
+              << " attempt=" << attempt << std::endl;
+}
+
 bool FetchMembership(const std::unique_ptr<MetadataService::Stub>& stub,
                      MembershipState* state) {
     MembershipRequest request;
@@ -169,8 +186,14 @@ bool SendPutWithRetry(const std::string& key, const std::string& value,
     for (int attempt = 0; attempt < 3; ++attempt) {
         int index = SelectWriteNodeIndex(*membership, key);
         if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
+            std::cout << "put route error: mode=" << membership->mode
+                      << " epoch=" << membership->epoch
+                      << " key=" << key
+                      << " selected_index=" << index
+                      << " members=" << membership->members.size() << std::endl;
             return false;
         }
+        PrintRouteDebug("put", *membership, key, index, attempt + 1);
         PutRequest request;
         request.set_request_id((*request_id)++);
         request.set_key(key);
@@ -183,15 +206,21 @@ bool SendPutWithRetry(const std::string& key, const std::string& value,
         grpc::ClientContext context;
         grpc::Status status = membership->stubs[index]->Put(&context, request, &response);
         if (!status.ok()) {
+            std::cout << "put rpc failed: code=" << status.error_code()
+                      << " message=" << status.error_message() << std::endl;
             continue;
         }
         if (response.success()) {
             *out_response = response;
             return true;
         }
+        std::cout << "put response error: " << response.error()
+                  << " version=" << response.version() << std::endl;
         if (response.error().rfind("WRONG_NODE", 0) == 0 ||
             response.error() == "STALE_EPOCH") {
+            std::cout << "refreshing membership after " << response.error() << std::endl;
             if (!FetchMembership(metadata_stub, membership)) {
+                std::cout << "membership refresh failed" << std::endl;
                 return false;
             }
             continue;
@@ -208,8 +237,14 @@ bool SendGetWithRetry(const std::string& key,
     for (int attempt = 0; attempt < 3; ++attempt) {
         int index = SelectReadNodeIndex(*membership, key);
         if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
+            std::cout << "get route error: mode=" << membership->mode
+                      << " epoch=" << membership->epoch
+                      << " key=" << key
+                      << " selected_index=" << index
+                      << " members=" << membership->members.size() << std::endl;
             return false;
         }
+        PrintRouteDebug("get", *membership, key, index, attempt + 1);
         GetRequest request;
         request.set_key(key);
         request.set_epoch(membership->epoch);
@@ -217,10 +252,15 @@ bool SendGetWithRetry(const std::string& key,
         grpc::ClientContext context;
         grpc::Status status = membership->stubs[index]->Get(&context, request, &response);
         if (!status.ok()) {
+            std::cout << "get rpc failed: code=" << status.error_code()
+                      << " message=" << status.error_message() << std::endl;
             continue;
         }
         if (response.error() == "WRONG_NODE" || response.error() == "STALE_EPOCH") {
+            std::cout << "get response error: " << response.error()
+                      << "; refreshing membership" << std::endl;
             if (!FetchMembership(metadata_stub, membership)) {
+                std::cout << "membership refresh failed" << std::endl;
                 return false;
             }
             continue;
@@ -449,6 +489,13 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 int index = SelectWriteNodeIndex(*membership, workload[i].first);
                 if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
                     failed += 1;
+                    if (failed <= 10) {
+                        std::cout << "bench route error: mode=" << membership->mode
+                                  << " epoch=" << membership->epoch
+                                  << " key=" << workload[i].first
+                                  << " selected_index=" << index
+                                  << " members=" << membership->members.size() << std::endl;
+                    }
                     continue;
                 }
 
@@ -490,6 +537,12 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                         } else if (!call->status.ok()) {
                             std::cout << ": " << call->status.error_message();
                         }
+                        std::cout << " target="
+                                  << MemberAddressAt(*membership,
+                                                     SelectWriteNodeIndex(*membership,
+                                                                         call->key))
+                                  << " mode=" << membership->mode
+                                  << " epoch=" << membership->epoch;
                         std::cout << std::endl;
                     }
                     continue;
