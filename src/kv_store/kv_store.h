@@ -1,11 +1,13 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <sys/types.h>
 #include <unordered_map>
-#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -21,11 +23,25 @@ class KVStore {
 private:
     friend class CraqReplication;
     friend class CrownReplication;
-    static std::unordered_map<std::string, Record> store_;
-    // when you receive an ack for a key, only put it in store if its version is higher than the current version in store
-    static std::unordered_map<std::string, std::unordered_map<uint64_t, Record>> dirty_store_;
-    static std::mutex mutex_store_;
-    static std::mutex mutex_dirty_store_;
+
+    // Stripe count chosen so that, even with the bench pushing >5K ops/s,
+    // expected contention per stripe is well under 1 op at a time. Powers of
+    // two would let us mask instead of mod, but std::hash already returns a
+    // well-distributed value.
+    static constexpr size_t kStripeCount = 256;
+
+    struct Stripe {
+        std::mutex mu;
+        std::unordered_map<std::string, Record> committed;
+        std::unordered_map<std::string, std::unordered_map<uint64_t, Record>> dirty;
+    };
+
+    static std::array<Stripe, kStripeCount> stripes_;
+
+    static Stripe& stripe_for(const std::string& key) {
+        return stripes_[std::hash<std::string>{}(key) % kStripeCount];
+    }
+
 public:
     // only put if version > latest version
     // if version == null, it means the request is from client to head, so we can just assign it a new version that is higher than the current version in store
@@ -33,7 +49,7 @@ public:
 
     static std::optional<std::string> get(const std::string& key);
 
-    // get the highest version (max in both store_ and dirty_store_) for a key
+    // get the highest version (max in both committed and dirty) for a key
     static uint64_t get_latest_version(const std::string& key);
 
     // only put it in clean store if its version is higher than the current version in store

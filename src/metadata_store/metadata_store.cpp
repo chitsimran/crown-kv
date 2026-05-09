@@ -355,6 +355,7 @@ int main(int argc, char** argv) {
 
     MetadataStoreService service(&state);
     grpc::ServerBuilder builder;
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 10000);
     builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());

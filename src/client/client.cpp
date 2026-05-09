@@ -870,7 +870,6 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
 
             uint64_t benchmark_id = 0;
             size_t first_commit_event = 0;
-            uint64_t accepted = 0;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 benchmark_id = state->next_benchmark_id++;
@@ -888,79 +887,152 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::unique_ptr<grpc::ClientAsyncResponseReader<PutResponse>> rpc;
             };
 
-            grpc::CompletionQueue completion_queue;
-            std::vector<std::unique_ptr<AsyncPutCall>> calls;
-            calls.reserve(count);
-            uint64_t failed = 0;
-            auto rpc_deadline = std::chrono::system_clock::now() + std::chrono::seconds(30);
-            auto bench_start = std::chrono::steady_clock::now();
-            std::vector<uint64_t> issued_by_node(membership->members.size(), 0);
-            for (uint64_t i = 0; i < count; ++i) {
-                int index = workload[i].target_index;
-                if (index < 0 || index >= static_cast<int>(membership->stubs.size())) {
-                    failed += 1;
-                    if (failed <= 10) {
-                        std::cout << "bench route error: mode=" << membership->mode
-                                  << " epoch=" << membership->epoch
-                                  << " key=" << workload[i].key
-                                  << " selected_index=" << index
-                                  << " members=" << membership->members.size() << std::endl;
-                    }
-                    continue;
-                }
+            // Sharded async issue + drain. Each shard owns one CompletionQueue
+            // with one issuer thread feeding it and one drainer thread consuming
+            // tags. This removes the single-threaded bottleneck on both the
+            // request-issue side and the response-drain side, and avoids
+            // contention on a shared CQ.
+            constexpr int kShardCount = 4;
+            constexpr auto kRpcDeadline = std::chrono::seconds(30);
 
-                auto call = std::make_unique<AsyncPutCall>();
-                call->index = i;
-                call->key = workload[i].key;
-                call->target_index = index;
-                call->entry = PendingEntry{std::chrono::steady_clock::now(), benchmark_id};
-                call->context.set_deadline(rpc_deadline);
-
-                PutRequest request;
-                request.set_request_id((*request_id)++);
-                request.set_key(workload[i].key);
-                request.set_value(workload[i].value);
-                request.set_version(0);
-                request.set_client_addr(listen_addr);
-
-                auto* tag = call.get();
-                call->rpc = membership->stubs[index]->PrepareAsyncPut(
-                    &call->context, request, &completion_queue);
-                call->rpc->StartCall();
-                call->rpc->Finish(&call->response, &call->status, tag);
-                issued_by_node[index] += 1;
-                calls.push_back(std::move(call));
+            std::vector<std::unique_ptr<grpc::CompletionQueue>> cqs;
+            cqs.reserve(kShardCount);
+            for (int i = 0; i < kShardCount; ++i) {
+                cqs.push_back(std::make_unique<grpc::CompletionQueue>());
             }
 
-            void* tag = nullptr;
-            bool ok = false;
-            uint64_t completed_acceptances = 0;
-            while (completed_acceptances < calls.size() &&
-                   completion_queue.Next(&tag, &ok)) {
-                completed_acceptances += 1;
-                auto* call = static_cast<AsyncPutCall*>(tag);
-                if (!ok || !call->status.ok() || !call->response.success()) {
-                    failed += 1;
-                    if (failed <= 10) {
-                        std::cout << "put failed at " << call->index;
-                        if (!call->response.error().empty()) {
-                            std::cout << ": " << call->response.error();
-                        } else if (!call->status.ok()) {
-                            std::cout << ": " << call->status.error_message();
+            std::vector<std::unique_ptr<AsyncPutCall>> calls(count);
+            std::atomic<uint64_t> issue_failed{0};
+            std::atomic<uint64_t> rpc_failed{0};
+            std::atomic<uint64_t> accepted_atomic{0};
+            std::atomic<uint64_t> printed_failures{0};
+
+            std::vector<std::atomic<uint64_t>> issued_by_node_atomic(
+                membership->members.size());
+            for (auto& c : issued_by_node_atomic) {
+                c.store(0);
+            }
+
+            auto issuer_fn = [&](int shard_id) {
+                auto& cq = *cqs[shard_id];
+                size_t chunk = (count + kShardCount - 1) / kShardCount;
+                size_t start = static_cast<size_t>(shard_id) * chunk;
+                size_t end = std::min(start + chunk, static_cast<size_t>(count));
+                for (size_t i = start; i < end; ++i) {
+                    int index = workload[i].target_index;
+                    if (index < 0 ||
+                        index >= static_cast<int>(membership->stubs.size())) {
+                        issue_failed.fetch_add(1);
+                        if (printed_failures.fetch_add(1) < 10) {
+                            std::cout << "bench route error: mode=" << membership->mode
+                                      << " epoch=" << membership->epoch
+                                      << " key=" << workload[i].key
+                                      << " selected_index=" << index
+                                      << " members=" << membership->members.size()
+                                      << std::endl;
                         }
-                        std::cout << " target="
-                                  << MemberAddressAt(*membership, call->target_index)
-                                  << " mode=" << membership->mode
-                                  << " epoch=" << membership->epoch;
-                        std::cout << std::endl;
+                        continue;
                     }
-                    continue;
+
+                    auto call = std::make_unique<AsyncPutCall>();
+                    call->index = i;
+                    call->key = workload[i].key;
+                    call->target_index = index;
+                    call->entry = PendingEntry{std::chrono::steady_clock::now(),
+                                               benchmark_id};
+                    // Per-call deadline so late-issued calls in a large bench
+                    // get a fresh 30 s budget instead of sharing a deadline
+                    // captured before the issue loop began.
+                    call->context.set_deadline(
+                        std::chrono::system_clock::now() + kRpcDeadline);
+
+                    PutRequest request;
+                    request.set_request_id((*request_id)++);
+                    request.set_key(workload[i].key);
+                    request.set_value(workload[i].value);
+                    request.set_version(0);
+                    request.set_client_addr(listen_addr);
+
+                    auto* tag = call.get();
+                    call->rpc = membership->stubs[index]->PrepareAsyncPut(
+                        &call->context, request, &cq);
+                    call->rpc->StartCall();
+                    call->rpc->Finish(&call->response, &call->status, tag);
+                    issued_by_node_atomic[index].fetch_add(1);
+                    calls[i] = std::move(call);
                 }
-                RecordAcceptedWrite(state, PendingKey{call->key, call->response.version()},
-                                    call->entry);
-                accepted += 1;
+            };
+
+            auto drainer_fn = [&](int shard_id) {
+                auto& cq = *cqs[shard_id];
+                void* tag = nullptr;
+                bool ok = false;
+                while (cq.Next(&tag, &ok)) {
+                    auto* call = static_cast<AsyncPutCall*>(tag);
+                    if (!ok || !call->status.ok() || !call->response.success()) {
+                        rpc_failed.fetch_add(1);
+                        if (printed_failures.fetch_add(1) < 10) {
+                            std::ostringstream out;
+                            out << "put failed at " << call->index;
+                            if (!call->response.error().empty()) {
+                                out << ": " << call->response.error();
+                            } else if (!call->status.ok()) {
+                                out << ": " << call->status.error_message();
+                            }
+                            out << " target="
+                                << MemberAddressAt(*membership, call->target_index)
+                                << " mode=" << membership->mode
+                                << " epoch=" << membership->epoch;
+                            std::cout << out.str() << std::endl;
+                        }
+                        continue;
+                    }
+                    RecordAcceptedWrite(
+                        state,
+                        PendingKey{call->key, call->response.version()},
+                        call->entry);
+                    accepted_atomic.fetch_add(1);
+                }
+            };
+
+            // Drainers must be running before issuers so tags can be consumed
+            // as soon as they complete (otherwise the gRPC client side queues
+            // them up and we waste memory plus delay accept latency).
+            std::vector<std::thread> drainers;
+            drainers.reserve(kShardCount);
+            for (int i = 0; i < kShardCount; ++i) {
+                drainers.emplace_back(drainer_fn, i);
             }
-            completion_queue.Shutdown();
+
+            std::vector<std::thread> issuers;
+            issuers.reserve(kShardCount);
+            for (int i = 0; i < kShardCount; ++i) {
+                issuers.emplace_back(issuer_fn, i);
+            }
+
+            for (auto& t : issuers) {
+                t.join();
+            }
+            // Capture the throughput-window origin AFTER the issue loop so the
+            // ~1 s of pure issue overhead at large N doesn't inflate elapsed.
+            // Commits that already arrived during issuance get clamped to 0
+            // by SnapshotBenchmarkSamples.
+            auto bench_start = std::chrono::steady_clock::now();
+
+            for (auto& cq : cqs) {
+                cq->Shutdown();
+            }
+            for (auto& t : drainers) {
+                t.join();
+            }
+
+            uint64_t failed = issue_failed.load() + rpc_failed.load();
+            uint64_t accepted = accepted_atomic.load();
+
+            std::vector<uint64_t> issued_by_node(issued_by_node_atomic.size(), 0);
+            for (size_t i = 0; i < issued_by_node_atomic.size(); ++i) {
+                issued_by_node[i] = issued_by_node_atomic[i].load();
+            }
             PrintTargetCounts("issued writes by target node", *membership,
                               issued_by_node, "writes");
 
@@ -1086,10 +1158,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    auto configure_ack_server = [](grpc::ServerBuilder& builder) {
+        // Every CommitAck for the entire bench arrives at this server, so the
+        // default sync config (single CQ, 1 poller) is the wall under load.
+        builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 1024);
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+        builder.AddChannelArgument(
+            GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 10000);
+        builder.SetSyncServerOption(grpc::ServerBuilder::NUM_CQS, 4);
+        builder.SetSyncServerOption(grpc::ServerBuilder::MIN_POLLERS, 4);
+        builder.SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, 16);
+    };
+
     if (repl) {
         ClientState state;
         CommitAckServiceImpl ack_service(&state);
         grpc::ServerBuilder builder;
+        configure_ack_server(builder);
         builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
         builder.RegisterService(&ack_service);
         std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
@@ -1134,6 +1221,7 @@ int main(int argc, char** argv) {
     ClientState state;
     CommitAckServiceImpl ack_service(&state);
     grpc::ServerBuilder builder;
+    configure_ack_server(builder);
     builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&ack_service);
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());

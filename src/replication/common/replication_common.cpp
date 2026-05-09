@@ -29,7 +29,11 @@ constexpr auto kForwardRpcDeadline = std::chrono::milliseconds(10000); // 10 sec
 // gRPC deadline for fire-and-forget ack RPCs (WriteAck/CommitAck). Long enough to
 // survive transient stalls but short enough that slow consumers don't bloat the CQ.
 constexpr auto kAckRpcDeadline = std::chrono::milliseconds(10000);
-constexpr size_t kForwardWorkerCount = 16;
+// 64 workers per node. Each forward is bounded by RPC latency to the successor
+// (~ms), so 16 was capping CROWN at ~5K ops/s per link. With 64 we still fit
+// comfortably under the channel's 1024 concurrent-stream limit and saturate
+// successor processing instead of the forwarder pool.
+constexpr size_t kForwardWorkerCount = 64;
 constexpr size_t kMaxForwardQueueSize = 100000;
 // After this many retries to a stuck successor, stop retrying. The entry stays
 // in pending_acks; a subsequent Reconfigure (driven by the metadata store on

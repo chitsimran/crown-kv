@@ -23,9 +23,10 @@ std::shared_ptr<ReplicationService::Stub> BuildStub(
 CrownReplication::CleanState CrownReplication::get_committed_state(
     const std::string& key) {
     CleanState state;
-    std::lock_guard<std::mutex> lock(KVStore::mutex_store_);
-    auto it = KVStore::store_.find(key);
-    if (it != KVStore::store_.end()) {
+    auto& stripe = KVStore::stripe_for(key);
+    std::lock_guard<std::mutex> lock(stripe.mu);
+    auto it = stripe.committed.find(key);
+    if (it != stripe.committed.end()) {
         state.version = it->second.verison;
         state.found = true;
     }
@@ -33,16 +34,18 @@ CrownReplication::CleanState CrownReplication::get_committed_state(
 }
 
 bool CrownReplication::has_dirty(const std::string& key) {
-    std::lock_guard<std::mutex> lock(KVStore::mutex_dirty_store_);
-    auto it = KVStore::dirty_store_.find(key);
-    return it != KVStore::dirty_store_.end() && !it->second.empty();
+    auto& stripe = KVStore::stripe_for(key);
+    std::lock_guard<std::mutex> lock(stripe.mu);
+    auto it = stripe.dirty.find(key);
+    return it != stripe.dirty.end() && !it->second.empty();
 }
 
 std::optional<Record> CrownReplication::get_dirty_record(const std::string& key,
                                                          uint64_t version) {
-    std::lock_guard<std::mutex> lock(KVStore::mutex_dirty_store_);
-    auto it = KVStore::dirty_store_.find(key);
-    if (it == KVStore::dirty_store_.end()) {
+    auto& stripe = KVStore::stripe_for(key);
+    std::lock_guard<std::mutex> lock(stripe.mu);
+    auto it = stripe.dirty.find(key);
+    if (it == stripe.dirty.end()) {
         return std::nullopt;
     }
     auto rec_it = it->second.find(version);

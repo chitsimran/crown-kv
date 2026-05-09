@@ -683,6 +683,9 @@ int main(int argc, char** argv) {
     builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
     builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
     builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+    // Allow peers to ping as frequently as every 10 s. Without this the gRPC
+    // default (5 min) causes ENHANCE_YOUR_CALM / GOAWAY for our 30 s keepalives.
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 10000);
     builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&metadata_service);
     builder.RegisterService(&replication_service);
