@@ -38,7 +38,7 @@ using replication::WriteAckResponse;
 
 namespace {
 
-constexpr int kHeartbeatIntervalMs = 500;
+constexpr int kHeartbeatIntervalMs = 400;
 constexpr int kRetryIntervalMs = 1000;
 
 enum class NodeState {
