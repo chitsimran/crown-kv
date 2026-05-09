@@ -66,6 +66,10 @@ struct ServerState {
     uint64_t drain_epoch = 0;
 };
 
+// Verbose per-RPC logging is opt-in (--verbose). Default is silent — logging on
+// every Put/ForwardPut/WriteAck under benchmark load is itself a hot-path cost.
+std::atomic<bool> g_verbose_server_logging{false};
+
 Replication* SelectReplicationForMode(const std::string& mode,
                                       ChainReplication* chain_replication,
                                       CraqReplication* craq_replication,
@@ -76,6 +80,9 @@ std::mutex log_mutex;
 void LogServerEvent(const std::string& event, const std::string& node_id,
                     const std::string& mode, uint64_t local_epoch,
                     const std::string& detail) {
+    if (!g_verbose_server_logging.load(std::memory_order_relaxed)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(log_mutex);
     std::cout << "[" << event << "] node=" << node_id
               << " mode=" << mode
@@ -87,7 +94,7 @@ class MetadataClient {
 public:
     explicit MetadataClient(const std::string& address)
         : stub_(MetadataService::NewStub(
-              grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
+              replication_common::get_or_create_channel(address))) {}
 
     bool GetMembership(MembershipResponse* response) {
         MembershipRequest request;
@@ -173,6 +180,13 @@ public:
         bool needs_sync = false;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
+            // Drop stale-epoch reconfigurations. A delayed/duplicate Reconfigure
+            // RPC must never clobber state derived from a newer epoch.
+            if (request->epoch() < state_->epoch) {
+                response->set_success(false);
+                response->set_node_id(state_->node_id);
+                return grpc::Status::OK;
+            }
             state_->epoch = request->epoch();
             state_->mode = request->mode();
             state_->membership.assign(request->membership().begin(), request->membership().end());
@@ -495,12 +509,11 @@ public:
                            "error=WRONG_MODE");
             return grpc::Status::OK;
         }
-        if (request->epoch() < local_epoch) {
-            response->set_success(false);
-            LogServerEvent("WriteAck.reject", node_id, mode, local_epoch,
-                           "error=STALE_EPOCH");
-            return grpc::Status::OK;
-        }
+        // WriteAcks flow backwards along the chain. We accept any epoch
+        // (request->epoch() <= local_epoch is fine — the request was issued at
+        // an older snapshot of the membership, and dropping the ack would orphan
+        // the predecessor's pending entry). If the ack carries a newer epoch,
+        // refresh asynchronously so we catch up.
         if (request->epoch() > local_epoch) {
             RefreshMembershipAsync();
         }
@@ -563,8 +576,12 @@ public:
             local_epoch = state_->epoch;
         }
         if (request->epoch() < local_epoch) {
+            // Signal staleness explicitly so the caller can distinguish "I am
+            // empty" from "your snapshot request is stale". gRPC FAILED_PRECONDITION
+            // is the correct status for "request was sensible but the system is
+            // not in the right state to satisfy it".
             response->set_epoch(local_epoch);
-            return grpc::Status::OK;
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "STALE_EPOCH");
         }
         if (request->epoch() > local_epoch) {
             RefreshMembershipAsync();
@@ -787,6 +804,7 @@ int main(int argc, char** argv) {
     std::string listen_addr = "0.0.0.0:50051";
     std::string metadata_addr = "127.0.0.1:50050";
 
+    bool verbose = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--node-id" && i + 1 < argc) {
@@ -795,6 +813,8 @@ int main(int argc, char** argv) {
             listen_addr = argv[++i];
         } else if (arg == "--metadata" && i + 1 < argc) {
             metadata_addr = argv[++i];
+        } else if (arg == "--verbose" || arg == "-v") {
+            verbose = true;
         }
     }
 
@@ -802,6 +822,9 @@ int main(int argc, char** argv) {
         std::cerr << "--node-id is required" << std::endl;
         return 1;
     }
+
+    g_verbose_server_logging.store(verbose, std::memory_order_relaxed);
+    replication_common::set_verbose_logging(verbose);
 
     ServerState state;
     state.node_id = node_id;
@@ -820,6 +843,13 @@ int main(int argc, char** argv) {
                                                   &craq_replication, &crown_replication,
                                                   &metadata_client);
     grpc::ServerBuilder builder;
+    // Match the channel-side concurrency tuning so a head node can drive many
+    // outstanding ForwardPut streams to its successor without head-of-line
+    // blocking inside the HTTP/2 layer.
+    builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 1024);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
     builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&metadata_service);
     builder.RegisterService(&replication_service);

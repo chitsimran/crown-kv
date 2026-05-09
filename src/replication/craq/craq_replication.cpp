@@ -123,15 +123,10 @@ PutResponse CraqReplication::handle_put(PutRequest request) {
 
         if (node_index == tail_index || !next_stub) {
             kv_store.mark_clean(request.key(), assigned_version);
-            add_to_pending_acks(request);
             if (prev_stub) {
-                send_ack(request.request_id(), prev_stub);
+                send_ack(request, prev_stub);
             }
-            send_ack(request.request_id(), nullptr);
-            {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_acks.erase(request.request_id());
-            }
+            send_ack(request, nullptr);
             return response;
         }
 
@@ -149,15 +144,10 @@ PutResponse CraqReplication::handle_put(PutRequest request) {
         if (!stale) {
             kv_store.mark_clean(request.key(), request.version());
         }
-        add_to_pending_acks(request);
         if (prev_stub) {
-            send_ack(request.request_id(), prev_stub);
+            send_ack(request, prev_stub);
         }
-        send_ack(request.request_id(), nullptr);
-        {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_acks.erase(request.request_id());
-        }
+        send_ack(request, nullptr);
         response.set_success(true);
         response.set_version(request.version());
         return response;
@@ -277,13 +267,9 @@ void CraqReplication::handle_ack(int64_t request_id) {
     }
 
     int head_index = 0;
-    if (node_index == head_index) {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_acks.erase(request_id);
-        return;
+    if (node_index != head_index) {
+        send_ack(request, prev_stub);
     }
-
-    send_ack(request_id, prev_stub);
 
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_acks.erase(request_id);

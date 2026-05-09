@@ -89,12 +89,9 @@ PutResponse ChainReplication::handle_put(PutRequest request) {
 
         if (ring_size == 1 || !next_stub) {
             kv_store.mark_clean(request.key(), assigned_version);
-            add_to_pending_acks(request);
-            send_ack(request.request_id(), prev_stub);
-            {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_acks.erase(request.request_id());
-            }
+            // Single-node ring: head == tail. prev_stub is null so this becomes a
+            // CommitAck to the client.
+            send_ack(request, prev_stub);
             return response;
         }
 
@@ -114,13 +111,8 @@ PutResponse ChainReplication::handle_put(PutRequest request) {
         if (!stale) {
             kv_store.mark_clean(request.key(), request.version());
         }
-        add_to_pending_acks(request);
-        send_ack(request.request_id(), prev_stub);
-        send_ack(request.request_id(), nullptr);
-        {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_acks.erase(request.request_id());
-        }
+        send_ack(request, prev_stub);
+        send_ack(request, nullptr);
         response.set_success(true);
         response.set_version(request.version());
         return response;
@@ -194,13 +186,9 @@ void ChainReplication::handle_ack(int64_t request_id) {
     }
 
     int head_index = 0;
-    if (node_index == head_index) {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_acks.erase(request_id);
-        return;
+    if (node_index != head_index) {
+        send_ack(request, prev_stub);
     }
-
-    send_ack(request_id, prev_stub);
 
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_acks.erase(request_id);

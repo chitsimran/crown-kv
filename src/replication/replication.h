@@ -51,8 +51,10 @@ public:
     // asynchronously forward the put request to the next node, and add it to pending_acks until you receive an ack for it
     void forward_put(PutRequest request, const std::shared_ptr<ReplicationService::Stub>& next_stub);
 
-    // if prev_stub is null, send ack to the client (source_ip in the request), else send ack to the prev node
-    void send_ack(int64_t request_id, const std::shared_ptr<ReplicationService::Stub>& prev_stub);
+    // If prev_stub is null, fire a CommitAck to the client (request.client_addr()).
+    // Otherwise, fire a WriteAck to the predecessor node. Both calls are async.
+    void send_ack(const PutRequest& request,
+                  const std::shared_ptr<ReplicationService::Stub>& prev_stub);
 
     void set_epoch(uint64_t epoch) { epoch_.store(epoch); }
 

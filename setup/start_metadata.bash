@@ -13,6 +13,7 @@ METADATA_PORT="${METADATA_PORT:-50050}"
 MEMBERS_ARG="${MEMBERS_ARG:?MEMBERS_ARG is required}"
 RUN_SCOPE="${RUN_SCOPE:-shared}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
 SESSION_NAME="crown_metadata_${METADATA_PORT}"
 
 echo "=== CROWN-KV metadata deploy starting (user: $DEPLOY_USER) ==="
@@ -168,7 +169,16 @@ start_metadata() {
     echo "attach: tmux -S $TMUX_SOCKET attach -t $SESSION_NAME"
 }
 
-prepare_repo
-resolve_project_dir
-build_project
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "SKIP_BUILD=1: skipping git pull and build; reusing existing binary"
+    resolve_project_dir
+    if [[ ! -x "$PROJECT_DIR/build/metadata_store" ]]; then
+        echo "ERROR: $PROJECT_DIR/build/metadata_store not found; cannot skip build"
+        exit 1
+    fi
+else
+    prepare_repo
+    resolve_project_dir
+    build_project
+fi
 start_metadata

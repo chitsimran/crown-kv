@@ -25,8 +25,6 @@ using replication::MetadataService;
 using replication::NodeInfo;
 using replication::ReconfigureRequest;
 using replication::ReconfigureResponse;
-using replication::ReportFailureRequest;
-using replication::ReportFailureResponse;
 using replication::SetModeRequest;
 using replication::SetModeResponse;
 using replication::SyncCompleteRequest;
@@ -34,8 +32,12 @@ using replication::SyncCompleteResponse;
 
 namespace {
 
-constexpr int kHeartbeatIntervalMs = 10000;
-constexpr int kHeartbeatMissThreshold = 200; // 10 seconds
+// Servers send heartbeats every 500ms (server.cpp::kHeartbeatIntervalMs). Match
+// that here so the threshold math reflects reality. 60 misses -> 30 s of silence
+// before a node is declared dead — long enough to ride out benchmark-induced
+// stalls, short enough to recover from real failures within a reasonable window.
+constexpr int kHeartbeatIntervalMs = 500;
+constexpr int kHeartbeatMissThreshold = 60; // 30 seconds
 constexpr int kFreezeAckTimeoutMs = 2000;
 
 struct ClusterState {
@@ -171,22 +173,6 @@ public:
     grpc::Status ReportSyncDone(grpc::ServerContext*, const SyncCompleteRequest*,
                                 SyncCompleteResponse* response) override {
         response->set_success(true);
-        return grpc::Status::OK;
-    }
-
-    grpc::Status ReportFailure(grpc::ServerContext*, const ReportFailureRequest* request,
-                               ReportFailureResponse* response) override {
-        uint64_t current_epoch = 0;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            current_epoch = state_->epoch;
-        }
-        std::cerr << "[metadata] ReportFailure received reporter=" << request->reporter_node_id()
-                  << " failed=" << request->failed_node_id()
-                  << " request_epoch=" << request->epoch()
-                  << " current_epoch=" << current_epoch << std::endl;
-        response->set_success(true);
-        std::thread(TriggerReconfigureRemove, state_, request->failed_node_id()).detach();
         return grpc::Status::OK;
     }
 

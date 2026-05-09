@@ -120,6 +120,7 @@ target_link_libraries(server PRIVATE
 
 add_executable(client
     src/client/client.cpp
+    src/replication/common/replication_common.cpp
 )
 target_include_directories(client PRIVATE
     ${CMAKE_SOURCE_DIR}/src

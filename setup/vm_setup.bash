@@ -34,6 +34,7 @@ NODE_PORT="${NODE_PORT:-50051}"
 CLIENT_ACK_PORT="${CLIENT_ACK_PORT:-6000}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 RUN_SCOPE="${RUN_SCOPE:-shared}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
 
 SSH_OPTS=(-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 if [[ -n "${SSH_KEY_LOCAL:-}" && -f "${SSH_KEY_LOCAL:-/dev/null}" ]]; then
@@ -89,7 +90,11 @@ MEMBERS_ARG="$(build_members_arg)"
 
 usage() {
     cat <<EOF
-Usage: $0 <setup|start|rerun|kill|repl-info>
+Usage: $0 <setup|start|rerun|kill|repl-info> [--skip-build]
+
+Options:
+  --skip-build, -n   Skip git pull and build on the VMs; reuse the existing binary.
+                     Equivalent to setting SKIP_BUILD=1 in the environment.
 
 Hosts:         $HOSTS_FILE
 Metadata host: $METADATA_HOST
@@ -115,7 +120,8 @@ remote_env_args() {
         "METADATA_ADDR=$METADATA_ADDR" \
         "MEMBERS_ARG=$MEMBERS_ARG" \
         "TMUX_SOCKET=$TMUX_SOCKET" \
-        "RUN_SCOPE=$RUN_SCOPE"
+        "RUN_SCOPE=$RUN_SCOPE" \
+        "SKIP_BUILD=$SKIP_BUILD"
 }
 
 copy_and_run() {
@@ -133,6 +139,19 @@ copy_and_run() {
 }
 
 action="${1:-}"
+shift || true
+for arg in "$@"; do
+    case "$arg" in
+        --skip-build|-n) SKIP_BUILD=1 ;;
+        *)
+            echo "Unknown option: $arg"
+            usage
+            exit 1
+            ;;
+    esac
+done
+export SKIP_BUILD
+
 case "$action" in
     setup)
         for host in "${ALL_SETUP_HOSTS[@]}"; do
