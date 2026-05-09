@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -144,6 +145,9 @@ int SelectWriteNodeIndex(const MembershipState& membership, const std::string& k
     if (ring_size == 0) {
         return -1;
     }
+    if (membership.mode == "CHAIN" || membership.mode == "CRAQ") {
+        return 0;
+    }
     return replication_common::head_index(key, ring_size);
 }
 
@@ -153,7 +157,7 @@ int SelectReadNodeIndex(const MembershipState& membership, const std::string& ke
         return -1;
     }
     if (membership.mode == "CHAIN") {
-        return replication_common::tail_index(key, ring_size);
+        return ring_size - 1;
     }
     return replication_common::head_index(key, ring_size);
 }
@@ -246,7 +250,7 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [key] [value]      Issue N writes, e.g. bench 100 k v\n"
+        << "  bench N [key] [value] [workers]  Open-loop writes, e.g. bench 100 k v 128\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -405,33 +409,109 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
         } else if (command == "bench") {
             if (words.size() < 2) {
-                std::cout << "usage: bench N [key-prefix] [value-prefix]" << std::endl;
+                std::cout << "usage: bench N [key-prefix] [value-prefix] [workers]" << std::endl;
                 continue;
             }
             uint64_t count = std::stoull(words[1]);
             std::string key_prefix = words.size() >= 3 ? words[2] : "key";
             std::string value_prefix = words.size() >= 4 ? words[3] : "value";
+            size_t worker_count = words.size() >= 5 ? std::stoull(words[4]) : 128;
+            if (worker_count == 0) {
+                worker_count = 1;
+            }
             uint64_t start_completed = 0;
             uint64_t accepted = 0;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 start_completed = state->completed;
             }
+
+            struct BenchTask {
+                uint64_t index = 0;
+                std::string key;
+                std::string value;
+                PendingEntry entry;
+            };
+
+            std::vector<std::pair<std::string, std::string>> workload;
+            workload.reserve(count);
+            for (uint64_t i = 0; i < count; ++i) {
+                workload.emplace_back(key_prefix + std::to_string(i),
+                                      value_prefix + std::to_string(i));
+            }
+
+            std::mutex queue_mutex;
+            std::condition_variable queue_cv;
+            std::deque<BenchTask> queue;
+            bool enqueue_done = false;
+            std::atomic<uint64_t> accepted_atomic{0};
+            std::atomic<uint64_t> failed_atomic{0};
+            std::mutex output_mutex;
+
+            auto worker = [&]() {
+                MembershipState local_membership = *membership;
+                while (true) {
+                    BenchTask task;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        queue_cv.wait(lock, [&]() {
+                            return enqueue_done || !queue.empty();
+                        });
+                        if (queue.empty()) {
+                            if (enqueue_done) {
+                                return;
+                            }
+                            continue;
+                        }
+                        task = std::move(queue.front());
+                        queue.pop_front();
+                    }
+
+                    PutResponse response;
+                    if (!SendPutWithRetry(task.key, task.value, listen_addr, request_id,
+                                          metadata_stub, &local_membership, &response) ||
+                        !response.success()) {
+                        failed_atomic.fetch_add(1);
+                        if (failed_atomic.load() <= 10) {
+                            std::lock_guard<std::mutex> lock(output_mutex);
+                            std::cout << "put failed at " << task.index << std::endl;
+                        }
+                        continue;
+                    }
+                    RecordAcceptedWrite(state, PendingKey{task.key, response.version()},
+                                        task.entry);
+                    accepted_atomic.fetch_add(1);
+                }
+            };
+
+            std::vector<std::thread> workers;
+            workers.reserve(worker_count);
+            for (size_t i = 0; i < worker_count; ++i) {
+                workers.emplace_back(worker);
+            }
+
             auto bench_start = std::chrono::steady_clock::now();
             for (uint64_t i = 0; i < count; ++i) {
-                std::string key = key_prefix + std::to_string(i);
-                std::string value = value_prefix + std::to_string(i);
-                PendingEntry entry{std::chrono::steady_clock::now()};
-                PutResponse response;
-                if (!SendPutWithRetry(key, value, listen_addr, request_id, metadata_stub,
-                                      membership, &response) ||
-                    !response.success()) {
-                    std::cout << "put failed at " << i << std::endl;
-                    continue;
+                BenchTask task;
+                task.index = i;
+                task.key = workload[i].first;
+                task.value = workload[i].second;
+                task.entry = PendingEntry{std::chrono::steady_clock::now()};
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    queue.push_back(std::move(task));
                 }
-                RecordAcceptedWrite(state, PendingKey{key, response.version()}, entry);
-                accepted += 1;
+                queue_cv.notify_one();
             }
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                enqueue_done = true;
+            }
+            queue_cv.notify_all();
+            for (auto& thread : workers) {
+                thread.join();
+            }
+            accepted = accepted_atomic.load();
             {
                 std::unique_lock<std::mutex> lock(state->mutex);
                 state->cv.wait(lock, [&]() {
@@ -441,7 +521,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
                 std::chrono::steady_clock::now() - bench_start);
             std::cout << "committed " << accepted << " writes in " << elapsed.count()
-                      << "s (" << (accepted / elapsed.count()) << " ops/sec)" << std::endl;
+                      << "s (" << (accepted / elapsed.count()) << " ops/sec)"
+                      << ", failed " << failed_atomic.load()
+                      << ", workers " << worker_count << std::endl;
         } else if (command == "pending") {
             PrintClientStats(state);
         } else {

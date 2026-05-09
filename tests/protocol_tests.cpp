@@ -113,6 +113,39 @@ void test_chain_rejects_read_at_non_tail() {
     assert(response.error() == "WRONG_NODE");
 }
 
+void test_chain_uses_fixed_head_for_client_writes() {
+    ChainReplication chain;
+    chain.update_membership(make_membership(2), "n0");
+
+    replication::PutRequest request;
+    request.set_request_id(104);
+    request.set_key(key_with_head_not_zero(2));
+    request.set_value("fixed-head");
+    request.set_version(0);
+    request.set_client_addr("invalid-client-address");
+    request.set_epoch(1);
+
+    auto response = chain.handle_put(request);
+    assert(response.success());
+    assert(response.version() > 0);
+}
+
+void test_chain_rejects_client_write_at_non_fixed_head() {
+    ChainReplication chain;
+    chain.update_membership(make_membership(2), "n1");
+
+    replication::PutRequest request;
+    request.set_request_id(105);
+    request.set_key("any-key");
+    request.set_value("wrong-head");
+    request.set_version(0);
+    request.set_epoch(1);
+
+    auto response = chain.handle_put(request);
+    assert(!response.success());
+    assert(response.error().rfind("WRONG_NODE", 0) == 0);
+}
+
 void test_crown_ack_stops_at_head() {
     CrownReplication crown;
     crown.update_membership(make_membership(1), "n0");
@@ -142,6 +175,8 @@ int main() {
     test_crown_rejects_client_write_at_non_head();
     test_crown_dirty_read_returns_committed_value();
     test_chain_rejects_read_at_non_tail();
+    test_chain_uses_fixed_head_for_client_writes();
+    test_chain_rejects_client_write_at_non_fixed_head();
     test_crown_ack_stops_at_head();
     std::cout << "protocol_tests passed" << std::endl;
     return 0;
