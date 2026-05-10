@@ -53,7 +53,25 @@ struct ServerState {
     std::string mode;
     std::vector<NodeInfo> membership;
     std::atomic<NodeState> state{NodeState::STARTING};
+    // Lock-free reads for the hot RPC path. Updated inside state->mutex so
+    // writers stay consistent; readers on the critical path skip the mutex.
+    std::atomic<uint64_t> epoch_fast{0};
+    std::atomic<int>      mode_fast{0}; // 0=none,1=CHAIN,2=CRAQ,3=CROWN
 };
+
+// Map mode string → mode_fast index (write-side only, not on hot path).
+int ModeToFast(const std::string& mode) {
+    if (mode == "CHAIN") return 1;
+    if (mode == "CRAQ")  return 2;
+    if (mode == "CROWN") return 3;
+    return 0;
+}
+
+// Integer-indexed replication dispatch — avoids string comparison per RPC.
+// Returns nullptr for unknown/unset mode (0).
+constexpr const char* FastToModeStr(int m) {
+    return m == 1 ? "CHAIN" : m == 2 ? "CRAQ" : m == 3 ? "CROWN" : "NONE";
+}
 
 // Verbose per-RPC logging is opt-in (--verbose). Default is silent — logging on
 // every Put/ForwardPut/WriteAck under benchmark load is itself a hot-path cost.
@@ -183,6 +201,8 @@ public:
             epoch_advanced = request->epoch() > state_->epoch;
             state_->epoch = request->epoch();
             state_->mode = request->mode();
+            state_->epoch_fast.store(request->epoch(), std::memory_order_release);
+            state_->mode_fast.store(ModeToFast(request->mode()), std::memory_order_release);
             state_->membership.assign(request->membership().begin(),
                                       request->membership().end());
             needs_sync = !request->added_node_id().empty() &&
@@ -246,14 +266,15 @@ private:
 class ReplicationGatewayService final : public ReplicationService::Service {
 public:
     ReplicationGatewayService(ServerState* state, ChainReplication* chain_replication,
-                                                            CraqReplication* craq_replication,
-                                                            CrownReplication* crown_replication,
-                                                            MetadataClient* metadata_client)
+                              CraqReplication* craq_replication,
+                              CrownReplication* crown_replication,
+                              MetadataClient* metadata_client)
         : state_(state),
+          node_id_(state->node_id),
           chain_replication_(chain_replication),
-                    craq_replication_(craq_replication),
-                    crown_replication_(crown_replication),
-                    metadata_client_(metadata_client) {}
+          craq_replication_(craq_replication),
+          crown_replication_(crown_replication),
+          metadata_client_(metadata_client) {}
 
     grpc::Status Put(grpc::ServerContext*, const PutRequest* request,
                      PutResponse* response) override {
@@ -262,36 +283,27 @@ public:
             response->set_error("SERVICE_UNAVAILABLE");
             return grpc::Status::OK;
         }
-        uint64_t local_epoch = 0;
-        std::string mode;
-        std::string node_id;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            local_epoch = state_->epoch;
-            mode = state_->mode;
-            node_id = state_->node_id;
-        }
-        {
+        uint64_t local_epoch = state_->epoch_fast.load(std::memory_order_acquire);
+        int      mode_fast   = state_->mode_fast.load(std::memory_order_acquire);
+        if (g_verbose_server_logging.load(std::memory_order_relaxed)) {
             std::ostringstream detail;
             detail << "request_id=" << request->request_id()
                    << " key=" << request->key()
                    << " version=" << request->version()
-                   << " client_epoch_ignored=" << request->epoch()
                    << " stamped_epoch=" << local_epoch
                    << " client_addr=" << request->client_addr();
-            LogServerEvent("Put.recv", node_id, mode, local_epoch, detail.str());
+            LogServerEvent("Put.recv", node_id_, FastToModeStr(mode_fast), local_epoch, detail.str());
         }
-        Replication* replication = SelectReplication(mode);
+        Replication* replication = SelectReplicationFast(mode_fast);
         if (!replication) {
             response->set_success(false);
             response->set_error("WRONG_MODE");
-            LogServerEvent("Put.reject", node_id, mode, local_epoch, "error=WRONG_MODE");
             return grpc::Status::OK;
         }
         PutRequest stamped_request = *request;
         stamped_request.set_epoch(local_epoch);
         *response = replication->handle_put(stamped_request);
-        {
+        if (g_verbose_server_logging.load(std::memory_order_relaxed)) {
             std::ostringstream detail;
             detail << "request_id=" << stamped_request.request_id()
                    << " key=" << stamped_request.key()
@@ -300,51 +312,40 @@ public:
             if (!response->error().empty()) {
                 detail << " error=" << response->error();
             }
-            LogServerEvent("Put.resp", node_id, mode, local_epoch, detail.str());
+            LogServerEvent("Put.resp", node_id_, FastToModeStr(mode_fast), local_epoch, detail.str());
         }
         return grpc::Status::OK;
     }
 
     grpc::Status ForwardPut(grpc::ServerContext*, const PutRequest* request,
                             PutResponse* response) override {
-        uint64_t local_epoch = 0;
-        std::string mode;
-        std::string node_id;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            local_epoch = state_->epoch;
-            mode = state_->mode;
-            node_id = state_->node_id;
-        }
-        {
+        uint64_t local_epoch = state_->epoch_fast.load(std::memory_order_acquire);
+        int      mode_fast   = state_->mode_fast.load(std::memory_order_acquire);
+        if (g_verbose_server_logging.load(std::memory_order_relaxed)) {
             std::ostringstream detail;
             detail << "request_id=" << request->request_id()
                    << " key=" << request->key()
                    << " version=" << request->version()
                    << " request_epoch=" << request->epoch()
                    << " client_addr=" << request->client_addr();
-            LogServerEvent("ForwardPut.recv", node_id, mode, local_epoch, detail.str());
+            LogServerEvent("ForwardPut.recv", node_id_, FastToModeStr(mode_fast), local_epoch, detail.str());
         }
-        Replication* replication = SelectReplication(mode);
+        Replication* replication = SelectReplicationFast(mode_fast);
         if (!replication) {
             response->set_success(false);
             response->set_error("WRONG_MODE");
-            LogServerEvent("ForwardPut.reject", node_id, mode, local_epoch,
-                           "error=WRONG_MODE");
             return grpc::Status::OK;
         }
         if (request->epoch() < local_epoch) {
             response->set_success(false);
             response->set_error("STALE_EPOCH");
-            LogServerEvent("ForwardPut.reject", node_id, mode, local_epoch,
-                           "error=STALE_EPOCH");
             return grpc::Status::OK;
         }
         if (request->epoch() > local_epoch) {
             RefreshMembershipAsync();
         }
         *response = replication->handle_put(*request);
-        {
+        if (g_verbose_server_logging.load(std::memory_order_relaxed)) {
             std::ostringstream detail;
             detail << "request_id=" << request->request_id()
                    << " key=" << request->key()
@@ -353,55 +354,39 @@ public:
             if (!response->error().empty()) {
                 detail << " error=" << response->error();
             }
-            LogServerEvent("ForwardPut.resp", node_id, mode, local_epoch, detail.str());
+            LogServerEvent("ForwardPut.resp", node_id_, FastToModeStr(mode_fast), local_epoch, detail.str());
         }
         return grpc::Status::OK;
     }
 
     grpc::Status Get(grpc::ServerContext*, const GetRequest* request,
                      GetResponse* response) override {
-        uint64_t local_epoch = 0;
-        std::string mode;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            local_epoch = state_->epoch;
-            mode = state_->mode;
-        }
-        Replication* replication = SelectReplication(mode);
+        uint64_t local_epoch = state_->epoch_fast.load(std::memory_order_acquire);
+        int      mode_fast   = state_->mode_fast.load(std::memory_order_acquire);
+        Replication* replication = SelectReplicationFast(mode_fast);
         if (!replication) {
             response->set_error("WRONG_MODE");
             return grpc::Status::OK;
         }
-        GetRequest stamped_request = *request;
-        stamped_request.set_epoch(local_epoch);
-        *response = replication->handle_get(stamped_request.key());
+        *response = replication->handle_get(request->key());
         return grpc::Status::OK;
     }
 
     grpc::Status SendWriteAck(grpc::ServerContext*, const WriteAck* request,
                               WriteAckResponse* response) override {
-        uint64_t local_epoch = 0;
-        std::string mode;
-        std::string node_id;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            local_epoch = state_->epoch;
-            mode = state_->mode;
-            node_id = state_->node_id;
-        }
-        {
+        uint64_t local_epoch = state_->epoch_fast.load(std::memory_order_acquire);
+        int      mode_fast   = state_->mode_fast.load(std::memory_order_acquire);
+        if (g_verbose_server_logging.load(std::memory_order_relaxed)) {
             std::ostringstream detail;
             detail << "request_id=" << request->request_id()
                    << " key=" << request->key()
                    << " version=" << request->version()
                    << " request_epoch=" << request->epoch();
-            LogServerEvent("WriteAck.recv", node_id, mode, local_epoch, detail.str());
+            LogServerEvent("WriteAck.recv", node_id_, FastToModeStr(mode_fast), local_epoch, detail.str());
         }
-        Replication* replication = SelectReplication(mode);
+        Replication* replication = SelectReplicationFast(mode_fast);
         if (!replication) {
             response->set_success(false);
-            LogServerEvent("WriteAck.reject", node_id, mode, local_epoch,
-                           "error=WRONG_MODE");
             return grpc::Status::OK;
         }
         // WriteAcks flow backwards along the chain. We accept any epoch
@@ -414,19 +399,13 @@ public:
         }
         replication->handle_ack(request->request_id());
         response->set_success(true);
-        LogServerEvent("WriteAck.resp", node_id, mode, local_epoch, "success=true");
         return grpc::Status::OK;
     }
 
     grpc::Status VersionQuery(grpc::ServerContext*, const VersionQueryRequest* request,
                               VersionQueryResponse* response) override {
-        uint64_t local_epoch = 0;
-        std::string mode;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            local_epoch = state_->epoch;
-            mode = state_->mode;
-        }
+        uint64_t local_epoch = state_->epoch_fast.load(std::memory_order_acquire);
+        int      mode_fast   = state_->mode_fast.load(std::memory_order_acquire);
         if (request->epoch() < local_epoch) {
             response->set_error("STALE_EPOCH");
             return grpc::Status::OK;
@@ -434,14 +413,12 @@ public:
         if (request->epoch() > local_epoch) {
             RefreshMembershipAsync();
         }
-        if (mode != "CRAQ" && mode != "CROWN") {
-            response->set_error("WRONG_MODE");
-            return grpc::Status::OK;
-        }
-        if (mode == "CRAQ") {
+        if (mode_fast == 2) {
             *response = craq_replication_->handle_version_query(*request);
-        } else {
+        } else if (mode_fast == 3) {
             *response = crown_replication_->handle_version_query(*request);
+        } else {
+            response->set_error("WRONG_MODE");
         }
         return grpc::Status::OK;
     }
@@ -486,6 +463,15 @@ private:
         return nullptr;
     }
 
+    Replication* SelectReplicationFast(int mode_fast) const {
+        switch (mode_fast) {
+            case 1: return chain_replication_;
+            case 2: return craq_replication_;
+            case 3: return crown_replication_;
+            default: return nullptr;
+        }
+    }
+
     // Pull membership from the metadata store. Used as a fallback when an RPC
     // arrives carrying an epoch newer than ours — typically that means we
     // missed (or are about to receive) a Reconfigure. We re-forward pending
@@ -507,6 +493,8 @@ private:
             epoch_advanced = true;
             state_->epoch = membership_response.epoch();
             state_->mode = membership_response.mode();
+            state_->epoch_fast.store(membership_response.epoch(), std::memory_order_release);
+            state_->mode_fast.store(ModeToFast(membership_response.mode()), std::memory_order_release);
             state_->membership.assign(membership_response.membership().begin(),
                                       membership_response.membership().end());
             membership_copy = state_->membership;
@@ -520,6 +508,7 @@ private:
     }
 
     ServerState* state_;
+    std::string node_id_;
     ChainReplication* chain_replication_;
     CraqReplication* craq_replication_;
     CrownReplication* crown_replication_;
@@ -562,6 +551,8 @@ void RefreshMembership(ServerState* state, MetadataClient* client,
         epoch_advanced = response.epoch() > state->epoch;
         state->epoch = response.epoch();
         state->mode = response.mode();
+        state->epoch_fast.store(response.epoch(), std::memory_order_release);
+        state->mode_fast.store(ModeToFast(response.mode()), std::memory_order_release);
         state->membership.assign(response.membership().begin(), response.membership().end());
         if (state->state.load() == NodeState::STARTING) {
             state->state.store(NodeState::NORMAL);
