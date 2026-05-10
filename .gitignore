@@ -67,3 +67,5 @@ compile_commands.json
 *.pb.cc
 *.grpc.pb.h
 *.grpc.pb.cc
+
+results/

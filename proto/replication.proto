@@ -151,6 +151,19 @@ message SetModeResponse {
     uint64 epoch = 3;
 }
 
+message ServerStatsRequest {}
+
+message ServerStatsResponse {
+    // CPU time consumed by the server process since its start.
+    uint64 utime_us = 1;
+    uint64 stime_us = 2;
+    // Monotonic timestamp at sample capture; pair with deltas of utime/stime
+    // to compute CPU% over a sampling window.
+    uint64 monotonic_ns = 3;
+    uint32 num_cpus = 4;
+    string node_id = 5;
+}
+
 service ReplicationService {
     rpc Put (PutRequest) returns (PutResponse);
     rpc Get (GetRequest) returns (GetResponse);
@@ -160,6 +173,7 @@ service ReplicationService {
     rpc VersionQuery (VersionQueryRequest) returns (VersionQueryResponse);
     rpc ForwardInflight (InflightRequest) returns (InflightResponse);
     rpc StateDump (StateDumpRequest) returns (StateDumpResponse);
+    rpc GetServerStats (ServerStatsRequest) returns (ServerStatsResponse);
 }
 
 service ClientAckService {

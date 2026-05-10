@@ -4,6 +4,9 @@
 #include "replication/crown/crown_replication.h"
 #include <grpcpp/grpcpp.h>
 
+#include <sys/resource.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -27,6 +30,8 @@ using replication::PutResponse;
 using replication::ReconfigureRequest;
 using replication::ReconfigureResponse;
 using replication::ReplicationService;
+using replication::ServerStatsRequest;
+using replication::ServerStatsResponse;
 using replication::StateDumpRequest;
 using replication::StateDumpResponse;
 using replication::SyncCompleteRequest;
@@ -420,6 +425,27 @@ public:
         } else {
             response->set_error("WRONG_MODE");
         }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status GetServerStats(grpc::ServerContext*, const ServerStatsRequest*,
+                                ServerStatsResponse* response) override {
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) != 0) {
+            return grpc::Status(grpc::StatusCode::INTERNAL, "getrusage failed");
+        }
+        uint64_t utime_us = static_cast<uint64_t>(ru.ru_utime.tv_sec) * 1000000ULL +
+                            static_cast<uint64_t>(ru.ru_utime.tv_usec);
+        uint64_t stime_us = static_cast<uint64_t>(ru.ru_stime.tv_sec) * 1000000ULL +
+                            static_cast<uint64_t>(ru.ru_stime.tv_usec);
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        response->set_utime_us(utime_us);
+        response->set_stime_us(stime_us);
+        response->set_monotonic_ns(static_cast<uint64_t>(now_ns));
+        response->set_num_cpus(static_cast<uint32_t>(ncpu > 0 ? ncpu : 1));
+        response->set_node_id(node_id_);
         return grpc::Status::OK;
     }
 

@@ -724,6 +724,130 @@ std::vector<benchmark::CommitSample> SnapshotBenchmarkSamples(
     return samples;
 }
 
+// Periodically polls every ring node's GetServerStats endpoint and records CPU%.
+// Each node samples its own utime+stime via getrusage; the client computes a
+// percentage as delta(cpu_us) / delta(wall_us) / num_cpus.
+class CpuSampler {
+public:
+    struct NodeSample {
+        std::string node_id;
+        std::string address;
+        double cpu_percent = 0.0;
+        double process_cpu_percent = 0.0;
+        uint32_t num_cpus = 1;
+    };
+    struct NodeStats {
+        std::string node_id;
+        std::string address;
+        std::vector<double> samples;
+        double avg() const {
+            if (samples.empty()) return 0.0;
+            double sum = 0;
+            for (double v : samples) sum += v;
+            return sum / samples.size();
+        }
+        double max_val() const {
+            if (samples.empty()) return 0.0;
+            return *std::max_element(samples.begin(), samples.end());
+        }
+        double p95() const {
+            if (samples.empty()) return 0.0;
+            std::vector<double> sorted = samples;
+            std::sort(sorted.begin(), sorted.end());
+            size_t idx = static_cast<size_t>(
+                std::ceil(0.95 * sorted.size())) - 1;
+            if (idx >= sorted.size()) idx = sorted.size() - 1;
+            return sorted[idx];
+        }
+    };
+
+    explicit CpuSampler(MembershipState membership,
+                        std::chrono::milliseconds interval = std::chrono::milliseconds(1000))
+        : interval_(interval), membership_(std::move(membership)) {}
+
+    void start() {
+        stop_.store(false);
+        thread_ = std::thread([this]() { run(); });
+    }
+
+    void stop() {
+        stop_.store(true);
+        if (thread_.joinable()) thread_.join();
+    }
+
+    std::vector<NodeStats> collect() {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::vector<NodeStats> out;
+        out.reserve(per_node_.size());
+        for (const auto& [addr, stats] : per_node_) {
+            out.push_back(stats);
+        }
+        std::sort(out.begin(), out.end(),
+                  [](const NodeStats& a, const NodeStats& b) {
+                      return a.address < b.address;
+                  });
+        return out;
+    }
+
+private:
+    struct PriorSample {
+        uint64_t utime_us = 0;
+        uint64_t stime_us = 0;
+        uint64_t monotonic_ns = 0;
+        bool present = false;
+    };
+
+    void run() {
+        std::unordered_map<std::string, PriorSample> priors;
+        while (!stop_.load()) {
+            for (size_t i = 0; i < membership_.members.size(); ++i) {
+                const std::string addr =
+                    replication_common::address_from_node(membership_.members[i]);
+                auto& stub = membership_.stubs[i];
+                if (!stub) continue;
+                replication::ServerStatsRequest req;
+                replication::ServerStatsResponse resp;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() +
+                                 std::chrono::milliseconds(500));
+                auto status = stub->GetServerStats(&ctx, req, &resp);
+                if (!status.ok()) continue;
+
+                auto& prior = priors[addr];
+                if (prior.present) {
+                    double dt_us =
+                        (resp.monotonic_ns() - prior.monotonic_ns) / 1000.0;
+                    double dcpu_us = static_cast<double>(
+                        (resp.utime_us() + resp.stime_us()) -
+                        (prior.utime_us + prior.stime_us));
+                    if (dt_us > 0.0) {
+                        uint32_t ncpu = resp.num_cpus() > 0 ? resp.num_cpus() : 1;
+                        double proc_pct = (dcpu_us / dt_us) * 100.0;
+                        double sys_pct = proc_pct / static_cast<double>(ncpu);
+                        std::lock_guard<std::mutex> lock(mu_);
+                        auto& stats = per_node_[addr];
+                        stats.address = addr;
+                        stats.node_id = resp.node_id();
+                        stats.samples.push_back(sys_pct);
+                    }
+                }
+                prior.utime_us = resp.utime_us();
+                prior.stime_us = resp.stime_us();
+                prior.monotonic_ns = resp.monotonic_ns();
+                prior.present = true;
+            }
+            std::this_thread::sleep_for(interval_);
+        }
+    }
+
+    std::chrono::milliseconds interval_;
+    MembershipState membership_;
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::mutex mu_;
+    std::unordered_map<std::string, NodeStats> per_node_;
+};
+
 std::string TimestampForFilename() {
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
@@ -1368,6 +1492,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             // issuers, so acks are recorded the moment they arrive.
             auto bench_start = std::chrono::steady_clock::now();
 
+            CpuSampler cpu_sampler(benchmark_routing.membership);
+            cpu_sampler.start();
+
             // Drainers must be running before issuers so tags can be consumed
             // as soon as they complete (otherwise the gRPC client side queues
             // them up and we waste memory plus delay accept latency).
@@ -1519,6 +1646,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     break;
                 }
             }
+            cpu_sampler.stop();
             auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
                 std::chrono::steady_clock::now() - bench_start);
             auto issue_dur = std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -1579,6 +1707,23 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                               << achievement;
                 }
                 std::cout << std::defaultfloat << std::endl;
+            }
+
+            auto cpu_stats = cpu_sampler.collect();
+            if (!cpu_stats.empty()) {
+                std::cout << "per-node CPU% (whole-system, sampled "
+                          << cpu_stats.front().samples.size()
+                          << "x at 1s intervals):" << std::endl;
+                std::cout << std::fixed << std::setprecision(1);
+                for (const auto& node : cpu_stats) {
+                    std::cout << "  " << node.address
+                              << "  node_id=" << node.node_id
+                              << "  avg=" << node.avg() << "%"
+                              << "  p95=" << node.p95() << "%"
+                              << "  max=" << node.max_val() << "%"
+                              << std::endl;
+                }
+                std::cout << std::defaultfloat;
             }
         } else if (command == "pending") {
             PrintClientStats(state);
