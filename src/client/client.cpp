@@ -306,6 +306,52 @@ bool SendGetWithRetry(const std::string& key,
     return false;
 }
 
+int FindMemberIndex(const MembershipState& membership, const std::string& selector) {
+    for (size_t i = 0; i < membership.members.size(); ++i) {
+        const auto& member = membership.members[i];
+        if (member.node_id() == selector ||
+            replication_common::address_from_node(member) == selector) {
+            return static_cast<int>(i);
+        }
+    }
+    try {
+        size_t parsed = 0;
+        int index = std::stoi(selector, &parsed);
+        if (parsed == selector.size() && index >= 0 &&
+            index < static_cast<int>(membership.members.size())) {
+            return index;
+        }
+    } catch (...) {
+    }
+    return -1;
+}
+
+bool SendGetToMember(const std::string& key, int index,
+                     const MembershipState& membership, GetResponse* out_response) {
+    if (index < 0 || index >= static_cast<int>(membership.stubs.size())) {
+        std::cout << "get-at route error: mode=" << membership.mode
+                  << " epoch=" << membership.epoch
+                  << " key=" << key
+                  << " selected_index=" << index
+                  << " members=" << membership.members.size() << std::endl;
+        return false;
+    }
+    PrintRouteDebug("get-at", membership, key, index, 1);
+    GetRequest request;
+    request.set_key(key);
+    request.set_epoch(membership.epoch);
+    GetResponse response;
+    grpc::ClientContext context;
+    grpc::Status status = membership.stubs[index]->Get(&context, request, &response);
+    if (!status.ok()) {
+        std::cout << "get-at rpc failed: code=" << status.error_code()
+                  << " message=" << status.error_message() << std::endl;
+        return false;
+    }
+    *out_response = response;
+    return true;
+}
+
 void PrintMembership(const MembershipState& membership) {
     std::cout << "Epoch: " << membership.epoch << std::endl;
     std::cout << "Mode: " << membership.mode << std::endl;
@@ -326,6 +372,7 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
+        << "  get-at NODE|INDEX|ADDR KEY Read by dialing one specific node\n"
         << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix]\n"
         << "                             Single-threaded async open-loop writes from a\n"
         << "                             CSV produced by setup/generate_kv_dataset.py.\n"
@@ -792,6 +839,27 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::cout << response.value() << " (version " << response.version() << ")"
                           << std::endl;
             }
+        } else if (command == "get-at") {
+            if (words.size() != 3) {
+                std::cout << "usage: get-at NODE_ID|INDEX|ADDRESS KEY" << std::endl;
+                continue;
+            }
+            int index = FindMemberIndex(*membership, words[1]);
+            if (index < 0) {
+                std::cout << "unknown member selector: " << words[1] << std::endl;
+                continue;
+            }
+            GetResponse response;
+            if (!SendGetToMember(words[2], index, *membership, &response)) {
+                std::cout << "get-at failed" << std::endl;
+                continue;
+            }
+            if (!response.error().empty()) {
+                std::cout << "error: " << response.error() << std::endl;
+            } else {
+                std::cout << response.value() << " (version " << response.version() << ")"
+                          << std::endl;
+            }
         } else if (command == "put" || command == "put-async") {
             if (words.size() < 3) {
                 std::cout << "usage: " << command << " KEY VALUE" << std::endl;
@@ -1108,6 +1176,7 @@ int main(int argc, char** argv) {
     std::string key_prefix = "key";
     std::string value_prefix = "value";
     std::string get_key;
+    std::string get_target;
     uint64_t put_count = 0;
     bool show_membership = false;
     bool repl = false;
@@ -1130,6 +1199,8 @@ int main(int argc, char** argv) {
             value_prefix = argv[++i];
         } else if (arg == "--get" && i + 1 < argc) {
             get_key = argv[++i];
+        } else if (arg == "--get-at" && i + 1 < argc) {
+            get_target = argv[++i];
         }
     }
 
@@ -1169,7 +1240,14 @@ int main(int argc, char** argv) {
 
     if (!get_key.empty()) {
         GetResponse response;
-        if (!SendGetWithRetry(get_key, metadata_stub, &membership, &response)) {
+        bool ok = false;
+        if (!get_target.empty()) {
+            int index = FindMemberIndex(membership, get_target);
+            ok = SendGetToMember(get_key, index, membership, &response);
+        } else {
+            ok = SendGetWithRetry(get_key, metadata_stub, &membership, &response);
+        }
+        if (!ok) {
             std::cerr << "Get failed" << std::endl;
             return 1;
         }

@@ -192,7 +192,7 @@ public:
             mode = state_->mode;
         }
         if (needs_sync) {
-            SyncFromPeer(membership_copy, node_id, request->epoch());
+            SyncFromPeer(membership_copy, node_id, mode, request->epoch());
             metadata_client_->SendSyncComplete(node_id, request->epoch());
         }
         ApplyMembership(membership_copy, node_id, mode, request->epoch(),
@@ -206,7 +206,8 @@ public:
 
 private:
     void SyncFromPeer(const std::vector<NodeInfo>& membership,
-                      const std::string& node_id, uint64_t epoch) {
+                      const std::string& node_id, const std::string& mode,
+                      uint64_t epoch) {
         for (const auto& member : membership) {
             if (member.node_id() == node_id) {
                 continue;
@@ -221,6 +222,11 @@ private:
             grpc::ClientContext context;
             grpc::Status status = stub->StateDump(&context, request, &response);
             if (!status.ok()) {
+                std::ostringstream detail;
+                detail << "source=" << member.node_id()
+                       << " status=" << status.error_code()
+                       << " message=" << status.error_message();
+                LogServerEvent("SyncFromPeer.fail", node_id, mode, epoch, detail.str());
                 continue;
             }
             std::unordered_map<std::string, std::string> values;
@@ -232,8 +238,18 @@ private:
                 versions[entry.first] = entry.second;
             }
             KVStore::apply_committed_snapshot(values, versions);
+            {
+                std::ostringstream detail;
+                detail << "source=" << member.node_id()
+                       << " snapshot_epoch=" << response.epoch()
+                       << " kv_count=" << values.size()
+                       << " version_count=" << versions.size();
+                LogServerEvent("SyncFromPeer.ok", node_id, mode, epoch, detail.str());
+            }
             return;
         }
+        LogServerEvent("SyncFromPeer.fail", node_id, mode, epoch,
+                       "error=no_available_source");
     }
 
     ServerState* state_;
@@ -362,19 +378,40 @@ public:
                      GetResponse* response) override {
         uint64_t local_epoch = 0;
         std::string mode;
+        std::string node_id;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             local_epoch = state_->epoch;
             mode = state_->mode;
+            node_id = state_->node_id;
+        }
+        {
+            std::ostringstream detail;
+            detail << "key=" << request->key()
+                   << " request_epoch=" << request->epoch()
+                   << " stamped_epoch=" << local_epoch;
+            LogServerEvent("Get.recv", node_id, mode, local_epoch, detail.str());
         }
         Replication* replication = SelectReplication(mode);
         if (!replication) {
             response->set_error("WRONG_MODE");
+            LogServerEvent("Get.reject", node_id, mode, local_epoch, "error=WRONG_MODE");
             return grpc::Status::OK;
         }
         GetRequest stamped_request = *request;
         stamped_request.set_epoch(local_epoch);
         *response = replication->handle_get(stamped_request.key());
+        {
+            std::ostringstream detail;
+            detail << "key=" << stamped_request.key()
+                   << " version=" << response->version();
+            if (!response->error().empty()) {
+                detail << " error=" << response->error();
+            } else {
+                detail << " value_bytes=" << response->value().size();
+            }
+            LogServerEvent("Get.resp", node_id, mode, local_epoch, detail.str());
+        }
         return grpc::Status::OK;
     }
 
@@ -449,9 +486,13 @@ public:
     grpc::Status StateDump(grpc::ServerContext*, const StateDumpRequest* request,
                            StateDumpResponse* response) override {
         uint64_t local_epoch = 0;
+        std::string mode;
+        std::string node_id;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             local_epoch = state_->epoch;
+            mode = state_->mode;
+            node_id = state_->node_id;
         }
         if (request->epoch() < local_epoch) {
             // Signal staleness explicitly so the caller can distinguish "I am
@@ -464,11 +505,19 @@ public:
         if (request->epoch() > local_epoch) {
             RefreshMembershipAsync();
         }
-        for (const auto& entry : KVStore::snapshot_committed()) {
+        auto snapshot = KVStore::snapshot_committed();
+        for (const auto& entry : snapshot) {
             (*response->mutable_kv_data())[entry.first] = entry.second.value;
             (*response->mutable_version_data())[entry.first] = entry.second.verison;
         }
         response->set_epoch(local_epoch);
+        {
+            std::ostringstream detail;
+            detail << "request_epoch=" << request->epoch()
+                   << " response_epoch=" << local_epoch
+                   << " kv_count=" << snapshot.size();
+            LogServerEvent("StateDump.resp", node_id, mode, local_epoch, detail.str());
+        }
         return grpc::Status::OK;
     }
 
