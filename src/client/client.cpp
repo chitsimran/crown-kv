@@ -1017,6 +1017,32 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 issuers.emplace_back(issuer_fn, i);
             }
 
+            // Watcher thread prints status every few seconds so a slow or
+            // failing run never looks frozen. Critical when a ring node is
+            // killed: ~N/3 calls sit in the CQ waiting for DEADLINE_EXCEEDED
+            // (30 s per call), and without this, the user sees no output
+            // between issue-end and the wait-for-CommitAck loop.
+            std::atomic<bool> watcher_done{false};
+            std::thread watcher([&]() {
+                while (!watcher_done.load()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    if (watcher_done.load()) {
+                        break;
+                    }
+                    uint64_t a = accepted_atomic.load();
+                    uint64_t fi = issue_failed.load();
+                    uint64_t fr = rpc_failed.load();
+                    uint64_t accounted = a + fi + fr;
+                    uint64_t in_flight = count > accounted ? count - accounted : 0;
+                    std::cout << "bench drain: accepted=" << a
+                              << " rpc_failed=" << fr
+                              << " issue_failed=" << fi
+                              << " in_flight=" << in_flight
+                              << "/" << count
+                              << std::endl;
+                }
+            });
+
             for (auto& t : issuers) {
                 t.join();
             }
@@ -1028,6 +1054,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             for (auto& t : drainers) {
                 t.join();
             }
+
+            watcher_done.store(true);
+            watcher.join();
 
             uint64_t failed = issue_failed.load() + rpc_failed.load();
             uint64_t accepted = accepted_atomic.load();
