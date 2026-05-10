@@ -369,7 +369,7 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix] [max-outstanding] [open|closed]\n"
+        << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix] [max-outstanding] [open|closed] [--rate N]\n"
         << "                             Async writes from a\n"
         << "                             CSV produced by setup/generate_kv_dataset.py.\n"
         << "                             hot% is the share of writes targeting hot keys;\n"
@@ -381,6 +381,9 @@ void PrintHelp() {
         << "                             with open or --open-loop. max-outstanding\n"
         << "                             defaults to 1000 for closed-loop and may be set\n"
         << "                             with --max-outstanding N.\n"
+        << "                             --rate N sets a fixed arrival rate (ops/sec) for\n"
+        << "                             open-loop. Writes are issued at rate N regardless\n"
+        << "                             of completions; above saturation the queue grows.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -935,6 +938,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             int window_ms = 1000;
             std::string output_prefix;
             uint64_t max_outstanding = 1000;
+            uint64_t target_rate = 0;
             bool closed_loop = true;
             bool bad_bench_arg = false;
 
@@ -982,6 +986,22 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                         break;
                     }
                     max_outstanding = std::stoull(value);
+                } else if (arg_lower == "--rate") {
+                    if (arg_index + 1 >= words.size() ||
+                        !IsUnsignedIntegerString(words[arg_index + 1])) {
+                        std::cout << "--rate requires a positive integer value" << std::endl;
+                        bad_bench_arg = true;
+                        break;
+                    }
+                    target_rate = std::stoull(words[++arg_index]);
+                } else if (arg_lower.rfind("--rate=", 0) == 0) {
+                    std::string value = words[arg_index].substr(7);
+                    if (!IsUnsignedIntegerString(value) || value == "0") {
+                        std::cout << "invalid --rate value: " << value << std::endl;
+                        bad_bench_arg = true;
+                        break;
+                    }
+                    target_rate = std::stoull(value);
                 } else if (IsUnsignedIntegerString(words[arg_index])) {
                     if (numeric_optional_index == 0) {
                         hot_share = std::stoi(words[arg_index]);
@@ -1091,12 +1111,17 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
             auto build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - build_start).count();
+            if (target_rate > 0 && closed_loop) {
+                std::cout << "warning: --rate is ignored in closed-loop mode" << std::endl;
+            }
             std::cout << "prepared workload: count=" << count
                       << " hot_share=" << hot_share << "%"
                       << " hot_set_share=" << hot_set_share << "%"
                       << " mode=" << (closed_loop ? "closed-loop" : "open-loop")
-                      << (closed_loop ? " max_outstanding=" : "")
-                      << (closed_loop ? std::to_string(max_outstanding) : "")
+                      << (closed_loop ? " max_outstanding=" + std::to_string(max_outstanding) : "")
+                      << (!closed_loop && target_rate > 0
+                              ? " target_rate=" + std::to_string(target_rate) + " ops/s"
+                              : (!closed_loop ? " target_rate=unlimited" : ""))
                       << " (" << build_ms << " ms)" << std::endl;
             PrintTargetCounts("planned write distribution", *membership,
                               CountTargets(workload, membership->members.size()),
@@ -1164,6 +1189,21 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 size_t chunk = (count + kShardCount - 1) / kShardCount;
                 size_t start = static_cast<size_t>(shard_id) * chunk;
                 size_t end = std::min(start + chunk, static_cast<size_t>(count));
+
+                // Fixed-rate open-loop: each shard fires at target_rate/kShardCount
+                // ops/s. Shards are staggered by one sub-interval so writes are
+                // spread evenly rather than bursting in groups of kShardCount.
+                std::chrono::steady_clock::time_point next_issue{};
+                std::chrono::nanoseconds rate_interval_ns{0};
+                if (!closed_loop && target_rate > 0) {
+                    int64_t interval_ns = static_cast<int64_t>(
+                        1e9 * kShardCount / static_cast<double>(target_rate));
+                    rate_interval_ns = std::chrono::nanoseconds(interval_ns);
+                    int64_t stagger_ns = interval_ns / kShardCount * shard_id;
+                    next_issue = std::chrono::steady_clock::now() +
+                                 std::chrono::nanoseconds(stagger_ns);
+                }
+
                 for (size_t i = start; i < end; ++i) {
                     if (closed_loop) {
                         std::unique_lock<std::mutex> lock(state->mutex);
@@ -1182,6 +1222,12 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                             break;
                         }
                         state->live_writes.fetch_add(1, std::memory_order_acq_rel);
+                    } else if (target_rate > 0) {
+                        auto now = std::chrono::steady_clock::now();
+                        if (now < next_issue) {
+                            std::this_thread::sleep_until(next_issue);
+                        }
+                        next_issue += rate_interval_ns;
                     }
 
                     int index = -1;
@@ -1504,8 +1550,10 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                       << " (" << throughput << " ops/sec)"
                       << ", wall " << elapsed.count() << "s"
                       << ", issue " << issue_dur.count() << "s"
-                      << (closed_loop ? ", max_outstanding " : "")
-                      << (closed_loop ? std::to_string(max_outstanding) : "")
+                      << (closed_loop ? ", max_outstanding " + std::to_string(max_outstanding) : "")
+                      << (!closed_loop && target_rate > 0
+                              ? ", target_rate " + std::to_string(target_rate) + " ops/s"
+                              : "")
                       << ", post-issue " << active_sec << "s"
                       << " (" << active_throughput << " ops/sec)"
                       << ", failed " << failed
