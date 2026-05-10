@@ -220,6 +220,16 @@ bool IsUnsignedIntegerString(const std::string& value) {
     });
 }
 
+std::string ToLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        if (c >= 'A' && c <= 'Z') {
+            return static_cast<char>(c - 'A' + 'a');
+        }
+        return static_cast<char>(c);
+    });
+    return value;
+}
+
 int SelectWriteNodeIndex(const MembershipState& membership, const std::string& key) {
     int ring_size = static_cast<int>(membership.members.size());
     if (ring_size == 0) {
@@ -351,16 +361,17 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix] [max-outstanding]\n"
-        << "                             Closed-loop async writes from a\n"
+        << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix] [max-outstanding] [open|closed]\n"
+        << "                             Async writes from a\n"
         << "                             CSV produced by setup/generate_kv_dataset.py.\n"
         << "                             hot% is the share of writes targeting hot keys;\n"
         << "                             hot-set% is the share of unique keys in the hot\n"
         << "                             pool. window-ms defaults to 1000. Throughput CSV\n"
         << "                             and PNG default to bench_results/throughput_*.{csv,png}.\n"
-        << "                             Key target nodes are precomputed before timing;\n"
-        << "                             max-outstanding defaults to 1000. A numeric sixth\n"
-        << "                             optional arg is treated as max-outstanding.\n"
+        << "                             Key target nodes are precomputed before timing.\n"
+        << "                             closed-loop is default; open-loop is available\n"
+        << "                             with open or --open-loop. max-outstanding\n"
+        << "                             defaults to 1000 for closed-loop.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -796,14 +807,14 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
         } else if (command == "bench") {
             if (words.size() < 2) {
-                std::cout << "usage: bench N [csv-path] [hot-share%] [hot-set-share%] [window-ms] [output-prefix] [max-outstanding]\n"
+                std::cout << "usage: bench N [csv-path] [hot-share%] [hot-set-share%] [window-ms] [output-prefix] [max-outstanding] [open|closed]\n"
                           << "  csv-path     defaults to setup/generated_kv_dataset/all_kv_pairs.csv\n"
                           << "  hot-share    0-100, percentage of writes targeting hot keys (default 0)\n"
                           << "  hot-set-share 1-100, percentage of unique keys in the hot pool (default 10)\n"
                           << "  window-ms    sliding throughput window in milliseconds (default 1000)\n"
                           << "  output-prefix defaults to bench_results/throughput_<timestamp>\n"
-                          << "  max-outstanding caps live in-flight writes (default 1000).\n"
-                          << "                  If the sixth optional arg is numeric, it is treated as max-outstanding."
+                          << "  max-outstanding caps live in-flight writes in closed-loop mode (default 1000)\n"
+                          << "  open|closed   closed-loop is default; use open or --open-loop for open-loop"
                           << std::endl;
                 continue;
             }
@@ -816,15 +827,29 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             int window_ms = words.size() >= 6 ? std::stoi(words[5]) : 1000;
             std::string output_prefix;
             uint64_t max_outstanding = 1000;
-            if (words.size() >= 7) {
-                if (words.size() == 7 && IsUnsignedIntegerString(words[6])) {
-                    max_outstanding = std::stoull(words[6]);
+            bool closed_loop = true;
+            bool bad_bench_arg = false;
+            for (size_t arg_index = 6; arg_index < words.size(); ++arg_index) {
+                const std::string arg_lower = ToLower(words[arg_index]);
+                if (arg_lower == "open" || arg_lower == "open-loop" ||
+                    arg_lower == "--open-loop") {
+                    closed_loop = false;
+                } else if (arg_lower == "closed" || arg_lower == "closed-loop" ||
+                           arg_lower == "--closed-loop") {
+                    closed_loop = true;
+                } else if (IsUnsignedIntegerString(words[arg_index])) {
+                    max_outstanding = std::stoull(words[arg_index]);
+                } else if (output_prefix.empty()) {
+                    output_prefix = words[arg_index];
                 } else {
-                    output_prefix = words[6];
+                    std::cout << "unknown bench option: " << words[arg_index]
+                              << std::endl;
+                    bad_bench_arg = true;
+                    break;
                 }
             }
-            if (words.size() >= 8) {
-                max_outstanding = std::stoull(words[7]);
+            if (bad_bench_arg) {
+                continue;
             }
             if (hot_share < 0 || hot_share > 100) {
                 std::cout << "hot-share must be 0-100" << std::endl;
@@ -838,7 +863,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::cout << "window-ms must be positive" << std::endl;
                 continue;
             }
-            if (max_outstanding == 0) {
+            if (closed_loop && max_outstanding == 0) {
                 std::cout << "max-outstanding must be positive" << std::endl;
                 continue;
             }
@@ -910,6 +935,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             std::cout << "prepared workload: count=" << count
                       << " hot_share=" << hot_share << "%"
                       << " hot_set_share=" << hot_set_share << "%"
+                      << " mode=" << (closed_loop ? "closed-loop" : "open-loop")
+                      << (closed_loop ? " max_outstanding=" : "")
+                      << (closed_loop ? std::to_string(max_outstanding) : "")
                       << " (" << build_ms << " ms)" << std::endl;
             PrintTargetCounts("planned write distribution", *membership,
                               CountTargets(workload, membership->members.size()),
@@ -971,7 +999,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 size_t start = static_cast<size_t>(shard_id) * chunk;
                 size_t end = std::min(start + chunk, static_cast<size_t>(count));
                 for (size_t i = start; i < end; ++i) {
-                    {
+                    if (closed_loop) {
                         std::unique_lock<std::mutex> lock(state->mutex);
                         state->cv.wait(lock, [&]() {
                             return stop_issuing.load(std::memory_order_acquire) ||
@@ -994,11 +1022,11 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     if (index < 0 ||
                         index >= static_cast<int>(membership->stubs.size())) {
                         issue_failed.fetch_add(1);
-                        {
+                        if (closed_loop) {
                             std::lock_guard<std::mutex> lock(state->mutex);
                             TryReleaseLiveWrite(state, benchmark_id);
+                            state->cv.notify_all();
                         }
-                        state->cv.notify_all();
                         if (printed_failures.fetch_add(1) < 10) {
                             std::cout << "bench route error: mode=" << membership->mode
                                       << " epoch=" << membership->epoch
@@ -1034,6 +1062,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                         &call->context, request, &cq);
                     call->rpc->StartCall();
                     call->rpc->Finish(&call->response, &call->status, tag);
+                    if (!closed_loop) {
+                        state->live_writes.fetch_add(1, std::memory_order_acq_rel);
+                    }
                     issued_by_node_atomic[index].fetch_add(1);
                     calls[i] = std::move(call);
                 }
@@ -1050,8 +1081,8 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                         {
                             std::lock_guard<std::mutex> lock(state->mutex);
                             TryReleaseLiveWrite(state, benchmark_id);
+                            state->cv.notify_all();
                         }
-                        state->cv.notify_all();
                         if (printed_failures.fetch_add(1) < 10) {
                             std::ostringstream out;
                             out << "put failed at " << call->index;
@@ -1138,7 +1169,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     auto now = std::chrono::steady_clock::now();
                     if (now - last_print >= kWatcherPrint) {
                         last_print = now;
-                        std::cout << "bench drain: accepted=" << a
+                        std::cout << "bench drain: bench_mode="
+                                  << (closed_loop ? "closed-loop" : "open-loop")
+                                  << " accepted=" << a
                                   << " committed=" << committed_now
                                   << " rpc_failed=" << fr
                                   << " issue_failed=" << fi
@@ -1149,7 +1182,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                                   << std::endl;
                     }
                     if (!stop_issuing.load(std::memory_order_acquire) &&
-                        live > 0 && stalled >= kIssueStallTimeout) {
+                        closed_loop && live > 0 && stalled >= kIssueStallTimeout) {
                         stop_issuing.store(true, std::memory_order_release);
                         state->cv.notify_all();
                         std::cout << "bench issuing stopped: no progress for "
@@ -1262,11 +1295,13 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 TryPlotThroughputCsv(csv_output_path, png_output_path);
             }
             std::cout << "committed " << committed << " writes"
+                      << " (" << (closed_loop ? "closed-loop" : "open-loop") << ")"
                       << " in " << last_commit_sec << "s"
                       << " (" << throughput << " ops/sec)"
                       << ", wall " << elapsed.count() << "s"
                       << ", issue " << issue_dur.count() << "s"
-                      << ", max_outstanding " << max_outstanding
+                      << (closed_loop ? ", max_outstanding " : "")
+                      << (closed_loop ? std::to_string(max_outstanding) : "")
                       << ", post-issue " << active_sec << "s"
                       << " (" << active_throughput << " ops/sec)"
                       << ", failed " << failed
