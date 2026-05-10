@@ -93,6 +93,14 @@ recovery plots. Add `open` or `--open-loop` for open-loop total-throughput runs.
 During a benchmark, transport failures or `WRONG_NODE` responses trigger a
 metadata refresh and route rebuild for future writes.
 
+Closed-loop concurrency can be swept with `--max-outstanding`:
+
+```text
+bench 250000 setup/generated_kv_dataset/all_kv_pairs.csv --max-outstanding 500
+bench 250000 setup/generated_kv_dataset/all_kv_pairs.csv --max-outstanding 1000
+bench 250000 setup/generated_kv_dataset/all_kv_pairs.csv --max-outstanding 5000
+```
+
 ## Restart / Stop
 
 ```bash

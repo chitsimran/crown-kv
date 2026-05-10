@@ -379,7 +379,8 @@ void PrintHelp() {
         << "                             Key target nodes are precomputed before timing.\n"
         << "                             closed-loop is default; open-loop is available\n"
         << "                             with open or --open-loop. max-outstanding\n"
-        << "                             defaults to 1000 for closed-loop.\n"
+        << "                             defaults to 1000 for closed-loop and may be set\n"
+        << "                             with --max-outstanding N.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -922,6 +923,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                           << "  window-ms    sliding throughput window in milliseconds (default 1000)\n"
                           << "  output-prefix defaults to bench_results/throughput_<timestamp>\n"
                           << "  max-outstanding caps live in-flight writes in closed-loop mode (default 1000)\n"
+                          << "                  positional, --max-outstanding N, or --max-outstanding=N\n"
                           << "  open|closed   closed-loop is default; use open or --open-loop for open-loop"
                           << std::endl;
                 continue;
@@ -957,6 +959,29 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 } else if (arg_lower == "closed" || arg_lower == "closed-loop" ||
                            arg_lower == "--closed-loop") {
                     closed_loop = true;
+                } else if (arg_lower == "--max-outstanding" ||
+                           arg_lower == "--max_outstanding" ||
+                           arg_lower == "--outstanding") {
+                    if (arg_index + 1 >= words.size() ||
+                        !IsUnsignedIntegerString(words[arg_index + 1])) {
+                        std::cout << words[arg_index]
+                                  << " requires a positive integer value" << std::endl;
+                        bad_bench_arg = true;
+                        break;
+                    }
+                    max_outstanding = std::stoull(words[++arg_index]);
+                } else if (arg_lower.rfind("--max-outstanding=", 0) == 0 ||
+                           arg_lower.rfind("--max_outstanding=", 0) == 0 ||
+                           arg_lower.rfind("--outstanding=", 0) == 0) {
+                    auto equals = words[arg_index].find('=');
+                    std::string value = words[arg_index].substr(equals + 1);
+                    if (!IsUnsignedIntegerString(value)) {
+                        std::cout << "invalid max-outstanding value: "
+                                  << value << std::endl;
+                        bad_bench_arg = true;
+                        break;
+                    }
+                    max_outstanding = std::stoull(value);
                 } else if (IsUnsignedIntegerString(words[arg_index])) {
                     if (numeric_optional_index == 0) {
                         hot_share = std::stoi(words[arg_index]);
