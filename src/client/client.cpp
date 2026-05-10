@@ -507,7 +507,8 @@ void PrintTargetCounts(const std::string& label,
     std::cout << label << " (mode=" << membership.mode
               << " epoch=" << membership.epoch
               << ", total=" << total << ")" << std::endl;
-    for (size_t i = 0; i < counts.size(); ++i) {
+    size_t printable = std::min(counts.size(), membership.members.size());
+    for (size_t i = 0; i < printable; ++i) {
         double pct = total > 0
             ? (100.0 * static_cast<double>(counts[i]) / static_cast<double>(total))
             : 0.0;
@@ -517,6 +518,35 @@ void PrintTargetCounts(const std::string& label,
                   << " @ " << MemberAddressAt(membership, static_cast<int>(i))
                   << ": " << counts[i] << " " << unit
                   << " (" << pct_text.str() << "%)" << std::endl;
+    }
+    if (counts.size() > membership.members.size()) {
+        uint64_t stale_total = 0;
+        for (size_t i = membership.members.size(); i < counts.size(); ++i) {
+            stale_total += counts[i];
+        }
+        if (stale_total > 0) {
+            std::cout << "  <stale membership indexes>: " << stale_total << " "
+                      << unit << std::endl;
+        }
+    }
+}
+
+void PrintIssuedTargetCounts(
+    const std::string& label,
+    const std::vector<std::pair<std::string, uint64_t>>& counts) {
+    uint64_t total = 0;
+    for (const auto& entry : counts) {
+        total += entry.second;
+    }
+    std::cout << label << " (total=" << total << ")" << std::endl;
+    for (const auto& entry : counts) {
+        double pct = total > 0
+            ? (100.0 * static_cast<double>(entry.second) / static_cast<double>(total))
+            : 0.0;
+        std::ostringstream pct_text;
+        pct_text << std::fixed << std::setprecision(2) << pct;
+        std::cout << "  " << entry.first << ": " << entry.second
+                  << " writes (" << pct_text.str() << "%)" << std::endl;
     }
 }
 
@@ -1075,11 +1105,8 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             std::atomic<uint64_t> skipped_due_to_stall{0};
             std::atomic<bool> stop_issuing{false};
 
-            std::vector<std::atomic<uint64_t>> issued_by_node_atomic(
-                membership->members.size());
-            for (auto& c : issued_by_node_atomic) {
-                c.store(0);
-            }
+            std::mutex issued_counts_mutex;
+            std::vector<std::pair<std::string, uint64_t>> issued_by_target;
 
             auto issuer_fn = [&](int shard_id) {
                 auto& cq = *cqs[shard_id];
@@ -1168,7 +1195,19 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     if (!closed_loop) {
                         state->live_writes.fetch_add(1, std::memory_order_acq_rel);
                     }
-                    issued_by_node_atomic[index].fetch_add(1);
+                    {
+                        std::lock_guard<std::mutex> lock(issued_counts_mutex);
+                        auto it = std::find_if(
+                            issued_by_target.begin(), issued_by_target.end(),
+                            [&](const std::pair<std::string, uint64_t>& entry) {
+                                return entry.first == call->target_addr;
+                            });
+                        if (it == issued_by_target.end()) {
+                            issued_by_target.emplace_back(call->target_addr, 1);
+                        } else {
+                            it->second += 1;
+                        }
+                    }
                     calls[i] = std::move(call);
                 }
             };
@@ -1326,12 +1365,12 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             uint64_t accepted = accepted_atomic.load();
             uint64_t skipped = skipped_due_to_stall.load();
 
-            std::vector<uint64_t> issued_by_node(issued_by_node_atomic.size(), 0);
-            for (size_t i = 0; i < issued_by_node_atomic.size(); ++i) {
-                issued_by_node[i] = issued_by_node_atomic[i].load();
+            std::vector<std::pair<std::string, uint64_t>> issued_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(issued_counts_mutex);
+                issued_snapshot = issued_by_target;
             }
-            PrintTargetCounts("issued writes by target node", *membership,
-                              issued_by_node, "writes");
+            PrintIssuedTargetCounts("issued writes by target node", issued_snapshot);
 
             // Wait for CommitAcks, but bail out if no progress is made for a
             // while. Without this, a single orphaned write (e.g. the original
