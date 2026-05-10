@@ -154,6 +154,14 @@ struct MembershipState {
     std::vector<std::shared_ptr<ReplicationService::Stub>> stubs;
 };
 
+struct BenchmarkRouting {
+    MembershipState membership;
+    std::vector<int> target_indexes;
+    std::mutex mutex;
+    std::atomic<bool> refresh_in_progress{false};
+    std::chrono::steady_clock::time_point last_refresh_attempt;
+};
+
 std::string MemberAddressAt(const MembershipState& membership, int index) {
     if (index < 0 || index >= static_cast<int>(membership.members.size())) {
         return "<invalid>";
@@ -535,6 +543,76 @@ bool PrecomputeWriteRoutes(const std::vector<KvRow>& dataset,
         routed_dataset->push_back(WorkloadItem{row.key, row.value, index});
     }
     return ok;
+}
+
+std::vector<uint64_t> CountBenchmarkTargets(
+    const BenchmarkRouting& routing, size_t member_count) {
+    std::vector<uint64_t> counts(member_count, 0);
+    for (const auto& target : routing.target_indexes) {
+        int index = target;
+        if (index >= 0 && index < static_cast<int>(counts.size())) {
+            counts[index] += 1;
+        }
+    }
+    return counts;
+}
+
+void RebuildBenchmarkRoutes(BenchmarkRouting* routing,
+                            const std::vector<WorkloadItem>& workload,
+                            const MembershipState& membership) {
+    if (routing->target_indexes.size() != workload.size()) {
+        routing->target_indexes.assign(workload.size(), -1);
+    }
+    for (size_t i = 0; i < workload.size(); ++i) {
+        routing->target_indexes[i] =
+            SelectWriteNodeIndex(membership, workload[i].key);
+    }
+}
+
+void MaybeRefreshBenchmarkRouting(
+    BenchmarkRouting* routing,
+    const std::unique_ptr<MetadataService::Stub>& metadata_stub,
+    MembershipState* repl_membership,
+    const std::vector<WorkloadItem>& workload,
+    const std::string& reason) {
+    bool expected = false;
+    if (!routing->refresh_in_progress.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(routing->mutex);
+        if (routing->last_refresh_attempt.time_since_epoch().count() != 0 &&
+            now - routing->last_refresh_attempt < std::chrono::seconds(1)) {
+            routing->refresh_in_progress.store(false, std::memory_order_release);
+            return;
+        }
+        routing->last_refresh_attempt = now;
+    }
+
+    MembershipState refreshed;
+    bool ok = FetchMembership(metadata_stub, &refreshed);
+    if (ok) {
+        std::lock_guard<std::mutex> lock(routing->mutex);
+        uint64_t old_epoch = routing->membership.epoch;
+        routing->membership = refreshed;
+        *repl_membership = refreshed;
+        RebuildBenchmarkRoutes(routing, workload, refreshed);
+        std::cout << "bench refreshed routes after " << reason
+                  << ": mode=" << refreshed.mode
+                  << " epoch=" << refreshed.epoch
+                  << " (was " << old_epoch << ")"
+                  << " members=" << refreshed.members.size() << std::endl;
+        PrintTargetCounts("updated write distribution", refreshed,
+                          CountBenchmarkTargets(*routing, refreshed.members.size()),
+                          "writes");
+    } else {
+        std::cout << "bench route refresh failed after " << reason << std::endl;
+    }
+    routing->refresh_in_progress.store(false, std::memory_order_release);
 }
 
 // Mirrors apply_hot_skew in setup/generate_kv_dataset.py: hot_share% of writes
@@ -943,6 +1021,13 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                               CountTargets(workload, membership->members.size()),
                               "writes");
 
+            BenchmarkRouting benchmark_routing;
+            {
+                std::lock_guard<std::mutex> lock(benchmark_routing.mutex);
+                benchmark_routing.membership = *membership;
+                RebuildBenchmarkRoutes(&benchmark_routing, workload, *membership);
+            }
+
             uint64_t benchmark_id = 0;
             size_t first_commit_event = 0;
             {
@@ -958,6 +1043,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 uint64_t index = 0;
                 std::string key;
                 int target_index = -1;
+                std::string target_addr;
+                std::string route_mode;
+                uint64_t route_epoch = 0;
                 PendingEntry entry;
                 grpc::ClientContext context;
                 PutResponse response;
@@ -1018,9 +1106,21 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                         state->live_writes.fetch_add(1, std::memory_order_acq_rel);
                     }
 
-                    int index = workload[i].target_index;
-                    if (index < 0 ||
-                        index >= static_cast<int>(membership->stubs.size())) {
+                    int index = -1;
+                    MembershipState route_membership;
+                    std::shared_ptr<ReplicationService::Stub> route_stub;
+                    {
+                        std::lock_guard<std::mutex> lock(benchmark_routing.mutex);
+                        if (i < benchmark_routing.target_indexes.size()) {
+                            index = benchmark_routing.target_indexes[i];
+                        }
+                        route_membership = benchmark_routing.membership;
+                        if (index >= 0 &&
+                            index < static_cast<int>(route_membership.stubs.size())) {
+                            route_stub = route_membership.stubs[index];
+                        }
+                    }
+                    if (!route_stub) {
                         issue_failed.fetch_add(1);
                         if (closed_loop) {
                             std::lock_guard<std::mutex> lock(state->mutex);
@@ -1028,11 +1128,11 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                             state->cv.notify_all();
                         }
                         if (printed_failures.fetch_add(1) < 10) {
-                            std::cout << "bench route error: mode=" << membership->mode
-                                      << " epoch=" << membership->epoch
+                            std::cout << "bench route error: mode=" << route_membership.mode
+                                      << " epoch=" << route_membership.epoch
                                       << " key=" << workload[i].key
                                       << " selected_index=" << index
-                                      << " members=" << membership->members.size()
+                                      << " members=" << route_membership.members.size()
                                       << std::endl;
                         }
                         continue;
@@ -1042,6 +1142,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     call->index = i;
                     call->key = workload[i].key;
                     call->target_index = index;
+                    call->target_addr = MemberAddressAt(route_membership, index);
+                    call->route_mode = route_membership.mode;
+                    call->route_epoch = route_membership.epoch;
                     call->entry = PendingEntry{std::chrono::steady_clock::now(),
                                                benchmark_id};
                     // Per-call deadline so late-issued calls in a large bench
@@ -1058,7 +1161,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     request.set_client_addr(listen_addr);
 
                     auto* tag = call.get();
-                    call->rpc = membership->stubs[index]->PrepareAsyncPut(
+                    call->rpc = route_stub->PrepareAsyncPut(
                         &call->context, request, &cq);
                     call->rpc->StartCall();
                     call->rpc->Finish(&call->response, &call->status, tag);
@@ -1086,17 +1189,28 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                         if (printed_failures.fetch_add(1) < 10) {
                             std::ostringstream out;
                             out << "put failed at " << call->index;
+                            std::string reason;
                             if (!call->response.error().empty()) {
-                                out << ": " << call->response.error();
+                                reason = call->response.error();
+                                out << ": " << reason;
                             } else if (!call->status.ok()) {
-                                out << ": " << call->status.error_message();
+                                reason = call->status.error_message();
+                                out << ": " << reason;
                             }
-                            out << " target="
-                                << MemberAddressAt(*membership, call->target_index)
-                                << " mode=" << membership->mode
-                                << " epoch=" << membership->epoch;
+                            out << " target=" << call->target_addr
+                                << " mode=" << call->route_mode
+                                << " epoch=" << call->route_epoch;
                             std::cout << out.str() << std::endl;
                         }
+                        std::string refresh_reason =
+                            !call->response.error().empty()
+                                ? call->response.error()
+                                : call->status.error_message();
+                        MaybeRefreshBenchmarkRouting(
+                            &benchmark_routing, metadata_stub, membership,
+                            workload, refresh_reason.empty()
+                                          ? std::string("put failure")
+                                          : refresh_reason);
                         continue;
                     }
                     RecordAcceptedWrite(

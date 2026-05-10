@@ -90,6 +90,8 @@ The benchmark precomputes each key's target node before timing begins, then
 prints how many writes it issued to each target node. It defaults to closed-loop
 mode capped by `max-outstanding` (default 1000), which is best for failure and
 recovery plots. Add `open` or `--open-loop` for open-loop total-throughput runs.
+During a benchmark, transport failures or `WRONG_NODE` responses trigger a
+metadata refresh and route rebuild for future writes.
 
 ## Restart / Stop
 
