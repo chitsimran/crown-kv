@@ -4,13 +4,10 @@
 #include "replication.grpc.pb.h"
 #include "../kv_store/kv_store.h"
 #include <chrono>
-#include <condition_variable>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -70,18 +67,4 @@ public:
 protected:
     std::atomic<uint64_t> epoch_{0};
 
-private:
-    struct ForwardTask {
-        PutRequest request;
-        std::shared_ptr<ReplicationService::Stub> stub;
-    };
-
-    void enqueue_forward_task(ForwardTask task);
-    void forward_worker_loop();
-
-    std::mutex forward_mutex_;
-    std::condition_variable forward_cv_;
-    std::deque<ForwardTask> forward_queue_;
-    std::vector<std::thread> forward_workers_;
-    bool forward_shutdown_ = false;
 };

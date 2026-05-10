@@ -29,16 +29,14 @@ constexpr auto kForwardRpcDeadline = std::chrono::milliseconds(10000); // 10 sec
 // gRPC deadline for fire-and-forget ack RPCs (WriteAck/CommitAck). Long enough to
 // survive transient stalls but short enough that slow consumers don't bloat the CQ.
 constexpr auto kAckRpcDeadline = std::chrono::milliseconds(10000);
-// 64 workers per node. Each forward is bounded by RPC latency to the successor
-// (~ms), so 16 was capping CROWN at ~5K ops/s per link. With 64 we still fit
-// comfortably under the channel's 1024 concurrent-stream limit and saturate
-// successor processing instead of the forwarder pool.
-constexpr size_t kForwardWorkerCount = 64;
-constexpr size_t kMaxForwardQueueSize = 100000;
 // After this many retries to a stuck successor, stop retrying. The entry stays
 // in pending_acks; a subsequent Reconfigure (driven by the metadata store on
 // failure detection) re-forwards through the new topology.
 constexpr int kMaxRetryCount = 3;
+// Sharded async completion queues for ForwardPut RPCs. Fire-and-forget: each
+// ForwardPut is issued immediately without blocking a gRPC server thread.
+// Sharding avoids a single CQ becoming the bottleneck under high forwarding load.
+constexpr size_t kForwardCQCount = 4;
 
 std::atomic<bool> g_log_verbose{false};
 
@@ -226,30 +224,94 @@ bool verbose_logging_enabled() {
 } // namespace replication_common
 
 // =============================================================================
+// Async ForwardPut pump — mirrors AsyncAckPump but for inter-node forwarding.
+// Sharded across kForwardCQCount CQs so the issuer path and the drainer path
+// never serialise on a single queue under high write load.
+// =============================================================================
+
+struct ForwardPutCall {
+    grpc::ClientContext context;
+    PutResponse response;
+    grpc::Status status;
+    uint64_t request_id;
+    std::string key;
+    std::unique_ptr<grpc::ClientAsyncResponseReader<PutResponse>> rpc;
+};
+
+class AsyncForwardPump {
+public:
+    static AsyncForwardPump& instance() {
+        static AsyncForwardPump pump;
+        return pump;
+    }
+
+    void issue(const std::shared_ptr<ReplicationService::Stub>& stub,
+               const PutRequest& request) {
+        auto* call = new ForwardPutCall();
+        call->request_id = request.request_id();
+        call->key = request.key();
+        call->context.set_deadline(
+            std::chrono::system_clock::now() + kForwardRpcDeadline);
+        size_t shard =
+            round_robin_.fetch_add(1, std::memory_order_relaxed) % kForwardCQCount;
+        call->rpc = stub->PrepareAsyncForwardPut(
+            &call->context, request, cqs_[shard].get());
+        call->rpc->StartCall();
+        call->rpc->Finish(&call->response, &call->status, call);
+    }
+
+private:
+    AsyncForwardPump() {
+        for (size_t i = 0; i < kForwardCQCount; ++i) {
+            cqs_.push_back(std::make_unique<grpc::CompletionQueue>());
+        }
+        for (size_t i = 0; i < kForwardCQCount; ++i) {
+            drainers_.emplace_back([this, i]() { drain(i); });
+        }
+    }
+
+    ~AsyncForwardPump() {
+        for (auto& cq : cqs_) {
+            cq->Shutdown();
+        }
+        for (auto& t : drainers_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    }
+
+    void drain(size_t shard) {
+        void* tag = nullptr;
+        bool ok = false;
+        while (cqs_[shard]->Next(&tag, &ok)) {
+            auto* call = static_cast<ForwardPutCall*>(tag);
+            if (!ok || !call->status.ok()) {
+                std::ostringstream out;
+                out << "async_forward_put_fail";
+                if (!call->status.ok()) {
+                    out << " code=" << static_cast<int>(call->status.error_code())
+                        << " msg=\"" << call->status.error_message() << "\"";
+                }
+                out << " request_id=" << call->request_id
+                    << " key=" << call->key;
+                LogReplicationEvent(out.str());
+            }
+            delete call;
+        }
+    }
+
+    std::vector<std::unique_ptr<grpc::CompletionQueue>> cqs_;
+    std::vector<std::thread> drainers_;
+    std::atomic<uint64_t> round_robin_{0};
+};
+
+// =============================================================================
 // Replication base class methods
 // =============================================================================
 
-Replication::Replication() {
-    forward_workers_.reserve(kForwardWorkerCount);
-    for (size_t i = 0; i < kForwardWorkerCount; ++i) {
-        forward_workers_.emplace_back([this]() {
-            forward_worker_loop();
-        });
-    }
-}
-
-Replication::~Replication() {
-    {
-        std::lock_guard<std::mutex> lock(forward_mutex_);
-        forward_shutdown_ = true;
-    }
-    forward_cv_.notify_all();
-    for (auto& worker : forward_workers_) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-}
+Replication::Replication() = default;
+Replication::~Replication() = default;
 
 void Replication::add_to_pending_acks(PutRequest request) {
     auto deadline = std::chrono::steady_clock::now() + kAckTimeout;
@@ -328,59 +390,7 @@ void Replication::forward_put(PutRequest request,
     }
     request.set_epoch(epoch_.load());
     add_to_pending_acks(request);
-
-    ForwardTask task;
-    task.request = std::move(request);
-    task.stub = next_stub;
-    enqueue_forward_task(std::move(task));
-}
-
-void Replication::enqueue_forward_task(ForwardTask task) {
-    {
-        std::unique_lock<std::mutex> lock(forward_mutex_);
-        forward_cv_.wait(lock, [this]() {
-            return forward_shutdown_ || forward_queue_.size() < kMaxForwardQueueSize;
-        });
-        if (forward_shutdown_) {
-            return;
-        }
-        forward_queue_.push_back(std::move(task));
-    }
-    forward_cv_.notify_one();
-}
-
-void Replication::forward_worker_loop() {
-    while (true) {
-        ForwardTask task;
-        {
-            std::unique_lock<std::mutex> lock(forward_mutex_);
-            forward_cv_.wait(lock, [this]() {
-                return forward_shutdown_ || !forward_queue_.empty();
-            });
-            if (forward_shutdown_ && forward_queue_.empty()) {
-                return;
-            }
-            task = std::move(forward_queue_.front());
-            forward_queue_.pop_front();
-        }
-        forward_cv_.notify_one();
-
-        grpc::ClientContext context;
-        context.set_deadline(std::chrono::system_clock::now() + kForwardRpcDeadline);
-        PutResponse response;
-        grpc::Status status = task.stub->ForwardPut(&context, task.request, &response);
-        if (!status.ok()) {
-            std::ostringstream out;
-            out << "forward_put_rpc_fail code=" << static_cast<int>(status.error_code())
-                << " message=\"" << status.error_message() << "\""
-                << " request_id=" << task.request.request_id()
-                << " key=" << task.request.key()
-                << " request_epoch=" << task.request.epoch();
-            LogReplicationEvent(out.str());
-        }
-        // Failure/recovery is the metadata store's responsibility, derived from
-        // heartbeats. Servers do not report peer failures based on RPC outcomes.
-    }
+    AsyncForwardPump::instance().issue(next_stub, request);
 }
 
 void Replication::send_ack(const PutRequest& request,
