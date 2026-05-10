@@ -995,6 +995,13 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 }
             };
 
+            // Throughput-window origin is captured BEFORE issuance starts so
+            // CommitAcks that arrive during the issue phase get plotted at
+            // their real time rather than clamped to t=0 (which would bunch
+            // them all into the first window). Drainers run concurrently with
+            // issuers, so acks are recorded the moment they arrive.
+            auto bench_start = std::chrono::steady_clock::now();
+
             // Drainers must be running before issuers so tags can be consumed
             // as soon as they complete (otherwise the gRPC client side queues
             // them up and we waste memory plus delay accept latency).
@@ -1013,11 +1020,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             for (auto& t : issuers) {
                 t.join();
             }
-            // Capture the throughput-window origin AFTER the issue loop so the
-            // ~1 s of pure issue overhead at large N doesn't inflate elapsed.
-            // Commits that already arrived during issuance get clamped to 0
-            // by SnapshotBenchmarkSamples.
-            auto bench_start = std::chrono::steady_clock::now();
+            auto issue_end = std::chrono::steady_clock::now();
 
             for (auto& cq : cqs) {
                 cq->Shutdown();
@@ -1084,6 +1087,8 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
             auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
                 std::chrono::steady_clock::now() - bench_start);
+            auto issue_dur = std::chrono::duration_cast<std::chrono::duration<double>>(
+                issue_end - bench_start);
             auto samples = SnapshotBenchmarkSamples(state, benchmark_id,
                                                      first_commit_event, bench_start);
             uint64_t committed = static_cast<uint64_t>(samples.size());
@@ -1093,6 +1098,11 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 last_commit_sec = std::max(last_commit_sec, sample.time_sec);
             }
             double throughput = last_commit_sec > 0.0 ? committed / last_commit_sec : 0.0;
+            // Active throughput excludes the issue phase: from the moment the
+            // last write was issued to the last CommitAck. Useful for comparing
+            // protocols when issue overhead is non-trivial relative to total wall.
+            double active_sec = last_commit_sec - issue_dur.count();
+            double active_throughput = active_sec > 0.0 ? committed / active_sec : 0.0;
             double window_sec = window_ms / 1000.0;
             auto rows = benchmark::BuildThroughputWindows(
                 samples, last_commit_sec, window_sec, failed, accepted, orphaned);
@@ -1101,12 +1111,16 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::cout << "throughput csv: " << csv_output_path.string() << std::endl;
                 TryPlotThroughputCsv(csv_output_path, png_output_path);
             }
-            std::cout << "committed " << committed << " writes in active "
-                      << last_commit_sec << "s (" << throughput << " ops/sec)"
+            std::cout << "committed " << committed << " writes"
+                      << " in " << last_commit_sec << "s"
+                      << " (" << throughput << " ops/sec)"
                       << ", wall " << elapsed.count() << "s"
+                      << ", issue " << issue_dur.count() << "s"
+                      << ", post-issue " << active_sec << "s"
+                      << " (" << active_throughput << " ops/sec)"
                       << ", failed " << failed
                       << ", orphaned " << orphaned
-                      << ", async single-threaded" << std::endl;
+                      << std::endl;
         } else if (command == "pending") {
             PrintClientStats(state);
         } else {
