@@ -3,6 +3,7 @@
 #include "replication.pb.h"
 #include "replication.grpc.pb.h"
 #include "../kv_store/kv_store.h"
+#include <array>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -35,11 +36,29 @@ public:
     // passed on by server in constructor // key -> tail node
     std::unordered_map<char, std::shared_ptr<ReplicationService::Stub>> key_tail_mapping;
 
-    std::unordered_map<int64_t, PendingEntry> pending_acks; // request_id -> entry
-    std::mutex pending_mutex_;
+    // Pending acks are sharded across kPendingShards stripes so concurrent
+    // forward/handle_ack operations on different request_ids don't serialise on
+    // a single mutex. This was the dominant per-node bottleneck under load:
+    // the prior single-mutex design saw ~10K acquisitions/sec on the middle
+    // node at 5K writes/sec, and contention there showed up as multi-second
+    // p99 latency despite headroom in CPU/network.
+    static constexpr size_t kPendingShards = 64;
+    struct PendingShard {
+        std::mutex mu;
+        std::unordered_map<int64_t, PendingEntry> map;
+    };
+    std::array<PendingShard, kPendingShards> pending_shards;
+
+    PendingShard& pending_shard_for(int64_t request_id) {
+        return pending_shards[static_cast<uint64_t>(request_id) % kPendingShards];
+    }
 
     void add_to_pending_acks(PutRequest request);
     void erase_pending_ack(int64_t request_id);
+    // Copy the pending request for request_id into *out if present.
+    // Returns true if an entry existed. Used by handle_ack paths so they can
+    // run their post-ack work outside the stripe lock.
+    bool find_pending_request(int64_t request_id, PutRequest* out);
 
     size_t pending_count();
     std::vector<PutRequest> snapshot_pending_requests();

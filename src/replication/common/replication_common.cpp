@@ -315,9 +315,11 @@ Replication::~Replication() = default;
 
 void Replication::add_to_pending_acks(PutRequest request) {
     auto deadline = std::chrono::steady_clock::now() + kAckTimeout;
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    auto it = pending_acks.find(request.request_id());
-    if (it != pending_acks.end()) {
+    int64_t id = request.request_id();
+    auto& shard = pending_shard_for(id);
+    std::lock_guard<std::mutex> lock(shard.mu);
+    auto it = shard.map.find(id);
+    if (it != shard.map.end()) {
         it->second.request = std::move(request);
         // Reset the deadline whenever the same entry is re-staged (e.g., a
         // Reconfigure-driven re-forward). Otherwise the entry could be marked
@@ -329,25 +331,43 @@ void Replication::add_to_pending_acks(PutRequest request) {
     entry.request = std::move(request);
     entry.deadline = deadline;
     entry.retry_count = 0;
-    pending_acks.emplace(entry.request.request_id(), std::move(entry));
+    shard.map.emplace(id, std::move(entry));
 }
 
 void Replication::erase_pending_ack(int64_t request_id) {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    pending_acks.erase(request_id);
+    auto& shard = pending_shard_for(request_id);
+    std::lock_guard<std::mutex> lock(shard.mu);
+    shard.map.erase(request_id);
+}
+
+bool Replication::find_pending_request(int64_t request_id, PutRequest* out) {
+    auto& shard = pending_shard_for(request_id);
+    std::lock_guard<std::mutex> lock(shard.mu);
+    auto it = shard.map.find(request_id);
+    if (it == shard.map.end()) {
+        return false;
+    }
+    *out = it->second.request;
+    return true;
 }
 
 size_t Replication::pending_count() {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    return pending_acks.size();
+    size_t total = 0;
+    for (auto& shard : pending_shards) {
+        std::lock_guard<std::mutex> lock(shard.mu);
+        total += shard.map.size();
+    }
+    return total;
 }
 
 std::vector<PutRequest> Replication::snapshot_pending_requests() {
     std::vector<PutRequest> snapshot;
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    snapshot.reserve(pending_acks.size());
-    for (const auto& entry : pending_acks) {
-        snapshot.push_back(entry.second.request);
+    for (auto& shard : pending_shards) {
+        std::lock_guard<std::mutex> lock(shard.mu);
+        snapshot.reserve(snapshot.size() + shard.map.size());
+        for (const auto& entry : shard.map) {
+            snapshot.push_back(entry.second.request);
+        }
     }
     // Order is irrelevant: each request is forwarded independently and version
     // numbers carry the ordering information needed by downstream replicas.
@@ -357,9 +377,9 @@ std::vector<PutRequest> Replication::snapshot_pending_requests() {
 std::vector<PutRequest> Replication::collect_expired_requests() {
     std::vector<PutRequest> expired;
     auto now = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        for (auto& kv : pending_acks) {
+    for (auto& shard : pending_shards) {
+        std::lock_guard<std::mutex> lock(shard.mu);
+        for (auto& kv : shard.map) {
             auto& entry = kv.second;
             if (entry.deadline > now) {
                 continue;

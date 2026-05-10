@@ -244,13 +244,8 @@ GetResponse CraqReplication::handle_get(std::string key) {
 
 void CraqReplication::handle_ack(int64_t request_id) {
     PutRequest request;
-    {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        auto it = pending_acks.find(request_id);
-        if (it == pending_acks.end()) {
-            return;
-        }
-        request = it->second.request;
+    if (!find_pending_request(request_id, &request)) {
+        return;
     }
 
     kv_store.mark_clean(request.key(), request.version());
@@ -274,8 +269,7 @@ void CraqReplication::handle_ack(int64_t request_id) {
         send_ack(request, prev_stub);
     }
 
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    pending_acks.erase(request_id);
+    erase_pending_ack(request_id);
 }
 
 std::shared_ptr<ReplicationService::Stub> CraqReplication::get_next_stub() {
