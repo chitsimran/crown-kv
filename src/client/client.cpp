@@ -777,7 +777,8 @@ bool WriteThroughputCsv(const std::filesystem::path& csv_path,
     }
 
     out << "time_sec,window_start_sec,window_end_sec,commits,throughput_ops_sec,"
-           "cumulative_commits,failed,accepted,orphaned\n";
+           "cumulative_commits,failed,accepted,orphaned,"
+           "latency_p50_ms,latency_p99_ms,latency_avg_ms\n";
     out << std::fixed << std::setprecision(6);
     for (const auto& row : rows) {
         out << row.time_sec << ','
@@ -788,7 +789,10 @@ bool WriteThroughputCsv(const std::filesystem::path& csv_path,
             << row.cumulative_commits << ','
             << row.failed << ','
             << row.accepted << ','
-            << row.orphaned << '\n';
+            << row.orphaned << ','
+            << row.latency_p50_ms << ','
+            << row.latency_p99_ms << ','
+            << row.latency_avg_ms << '\n';
     }
     return true;
 }
@@ -1544,6 +1548,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::cout << "throughput csv: " << csv_output_path.string() << std::endl;
                 TryPlotThroughputCsv(csv_output_path, png_output_path);
             }
+            auto latency_summary = benchmark::SummarizeLatencies(samples);
             std::cout << "committed " << committed << " writes"
                       << " (" << (closed_loop ? "closed-loop" : "open-loop") << ")"
                       << " in " << last_commit_sec << "s"
@@ -1560,6 +1565,21 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                       << ", skipped " << skipped
                       << ", orphaned " << orphaned
                       << std::endl;
+            if (!samples.empty()) {
+                std::cout << std::fixed << std::setprecision(2)
+                          << "latency_ms: avg=" << latency_summary.avg_ms
+                          << " p50=" << latency_summary.p50_ms
+                          << " p95=" << latency_summary.p95_ms
+                          << " p99=" << latency_summary.p99_ms
+                          << " p999=" << latency_summary.p999_ms
+                          << " max=" << latency_summary.max_ms;
+                if (!closed_loop && target_rate > 0) {
+                    double achievement = throughput / static_cast<double>(target_rate);
+                    std::cout << " | achieved/target=" << std::setprecision(3)
+                              << achievement;
+                }
+                std::cout << std::defaultfloat << std::endl;
+            }
         } else if (command == "pending") {
             PrintClientStats(state);
         } else {
