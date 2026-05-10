@@ -927,17 +927,29 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 continue;
             }
             uint64_t count = std::stoull(words[1]);
-            std::string csv_path = words.size() >= 3
-                ? words[2]
-                : std::string("setup/generated_kv_dataset/all_kv_pairs.csv");
-            int hot_share = words.size() >= 4 ? std::stoi(words[3]) : 0;
-            int hot_set_share = words.size() >= 5 ? std::stoi(words[4]) : 10;
-            int window_ms = words.size() >= 6 ? std::stoi(words[5]) : 1000;
+            std::string csv_path = "setup/generated_kv_dataset/all_kv_pairs.csv";
+            int hot_share = 0;
+            int hot_set_share = 10;
+            int window_ms = 1000;
             std::string output_prefix;
             uint64_t max_outstanding = 1000;
             bool closed_loop = true;
             bool bad_bench_arg = false;
-            for (size_t arg_index = 6; arg_index < words.size(); ++arg_index) {
+
+            auto is_bench_mode_arg = [](const std::string& arg) {
+                std::string arg_lower = ToLower(arg);
+                return arg_lower == "open" || arg_lower == "open-loop" ||
+                       arg_lower == "--open-loop" || arg_lower == "closed" ||
+                       arg_lower == "closed-loop" || arg_lower == "--closed-loop";
+            };
+
+            size_t arg_index = 2;
+            if (arg_index < words.size() && !is_bench_mode_arg(words[arg_index])) {
+                csv_path = words[arg_index++];
+            }
+
+            int numeric_optional_index = 0;
+            for (; arg_index < words.size(); ++arg_index) {
                 const std::string arg_lower = ToLower(words[arg_index]);
                 if (arg_lower == "open" || arg_lower == "open-loop" ||
                     arg_lower == "--open-loop") {
@@ -946,7 +958,21 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                            arg_lower == "--closed-loop") {
                     closed_loop = true;
                 } else if (IsUnsignedIntegerString(words[arg_index])) {
-                    max_outstanding = std::stoull(words[arg_index]);
+                    if (numeric_optional_index == 0) {
+                        hot_share = std::stoi(words[arg_index]);
+                    } else if (numeric_optional_index == 1) {
+                        hot_set_share = std::stoi(words[arg_index]);
+                    } else if (numeric_optional_index == 2) {
+                        window_ms = std::stoi(words[arg_index]);
+                    } else if (numeric_optional_index == 3) {
+                        max_outstanding = std::stoull(words[arg_index]);
+                    } else {
+                        std::cout << "too many numeric bench options: "
+                                  << words[arg_index] << std::endl;
+                        bad_bench_arg = true;
+                        break;
+                    }
+                    numeric_optional_index += 1;
                 } else if (output_prefix.empty()) {
                     output_prefix = words[arg_index];
                 } else {
