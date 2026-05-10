@@ -86,8 +86,9 @@ python setup/generate_kv_dataset.py --total-pairs 20000 --file-name hot_20.csv -
 `--output-file` still accepts a full custom path.
 The default output file is `setup/generated_kv_dataset/all_kv_pairs.csv`.
 
-The benchmark precomputes each key's target node before timing begins, then
-prints how many writes it issued to each target node.
+The benchmark precomputes each key's target node before timing begins, runs as a
+closed-loop workload capped by `max-outstanding` (default 1000), then prints how
+many writes it issued to each target node.
 
 ## Restart / Stop
 

@@ -90,7 +90,24 @@ struct ClientState {
     std::chrono::steady_clock::time_point start_time;
     uint64_t next_benchmark_id = 1;
     std::vector<CommitEvent> commit_events;
+    std::atomic<uint64_t> live_writes{0};
+    std::atomic<uint64_t> current_benchmark_id{0};
 };
+
+bool TryReleaseLiveWrite(ClientState* state, uint64_t benchmark_id) {
+    if (state->current_benchmark_id.load(std::memory_order_acquire) != benchmark_id) {
+        return false;
+    }
+    uint64_t live = state->live_writes.load(std::memory_order_relaxed);
+    while (live > 0) {
+        if (state->live_writes.compare_exchange_weak(
+                live, live - 1, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 void RecordCommitLocked(ClientState* state, const PendingEntry& entry,
                         std::chrono::steady_clock::time_point committed_at) {
@@ -101,6 +118,8 @@ void RecordCommitLocked(ClientState* state, const PendingEntry& entry,
     state->completed += 1;
     state->commit_events.push_back(
         CommitEvent{committed_at, latency_ms, state->completed, entry.benchmark_id});
+    TryReleaseLiveWrite(state, entry.benchmark_id);
+    state->cv.notify_all();
 }
 
 class CommitAckServiceImpl final : public ClientAckService::Service {
@@ -190,6 +209,15 @@ std::string JoinWords(const std::vector<std::string>& words, size_t begin) {
         joined += words[i];
     }
     return joined;
+}
+
+bool IsUnsignedIntegerString(const std::string& value) {
+    if (value.empty()) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](char c) {
+        return c >= '0' && c <= '9';
+    });
 }
 
 int SelectWriteNodeIndex(const MembershipState& membership, const std::string& key) {
@@ -323,14 +351,16 @@ void PrintHelp() {
         << "  put KEY VALUE              Write and wait for CommitAck\n"
         << "  put-async KEY VALUE        Write and return after head acceptance\n"
         << "  get KEY                    Read using current routing rules\n"
-        << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix]\n"
-        << "                             Single-threaded async open-loop writes from a\n"
+        << "  bench N [csv] [hot%] [hot-set%] [window-ms] [output-prefix] [max-outstanding]\n"
+        << "                             Closed-loop async writes from a\n"
         << "                             CSV produced by setup/generate_kv_dataset.py.\n"
         << "                             hot% is the share of writes targeting hot keys;\n"
         << "                             hot-set% is the share of unique keys in the hot\n"
         << "                             pool. window-ms defaults to 1000. Throughput CSV\n"
         << "                             and PNG default to bench_results/throughput_*.{csv,png}.\n"
-        << "                             Key target nodes are precomputed before timing.\n"
+        << "                             Key target nodes are precomputed before timing;\n"
+        << "                             max-outstanding defaults to 1000. A numeric sixth\n"
+        << "                             optional arg is treated as max-outstanding.\n"
         << "  pending                    Show client-side uncommitted writes\n"
         << "  refresh                    Refetch membership from metadata_store\n"
         << "  help                       Show this help\n"
@@ -766,12 +796,14 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
         } else if (command == "bench") {
             if (words.size() < 2) {
-                std::cout << "usage: bench N [csv-path] [hot-share%] [hot-set-share%] [window-ms] [output-prefix]\n"
+                std::cout << "usage: bench N [csv-path] [hot-share%] [hot-set-share%] [window-ms] [output-prefix] [max-outstanding]\n"
                           << "  csv-path     defaults to setup/generated_kv_dataset/all_kv_pairs.csv\n"
                           << "  hot-share    0-100, percentage of writes targeting hot keys (default 0)\n"
                           << "  hot-set-share 1-100, percentage of unique keys in the hot pool (default 10)\n"
                           << "  window-ms    sliding throughput window in milliseconds (default 1000)\n"
-                          << "  output-prefix defaults to bench_results/throughput_<timestamp>"
+                          << "  output-prefix defaults to bench_results/throughput_<timestamp>\n"
+                          << "  max-outstanding caps live in-flight writes (default 1000).\n"
+                          << "                  If the sixth optional arg is numeric, it is treated as max-outstanding."
                           << std::endl;
                 continue;
             }
@@ -782,7 +814,18 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             int hot_share = words.size() >= 4 ? std::stoi(words[3]) : 0;
             int hot_set_share = words.size() >= 5 ? std::stoi(words[4]) : 10;
             int window_ms = words.size() >= 6 ? std::stoi(words[5]) : 1000;
-            std::string output_prefix = words.size() >= 7 ? words[6] : "";
+            std::string output_prefix;
+            uint64_t max_outstanding = 1000;
+            if (words.size() >= 7) {
+                if (words.size() == 7 && IsUnsignedIntegerString(words[6])) {
+                    max_outstanding = std::stoull(words[6]);
+                } else {
+                    output_prefix = words[6];
+                }
+            }
+            if (words.size() >= 8) {
+                max_outstanding = std::stoull(words[7]);
+            }
             if (hot_share < 0 || hot_share > 100) {
                 std::cout << "hot-share must be 0-100" << std::endl;
                 continue;
@@ -793,6 +836,10 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             }
             if (window_ms <= 0) {
                 std::cout << "window-ms must be positive" << std::endl;
+                continue;
+            }
+            if (max_outstanding == 0) {
+                std::cout << "max-outstanding must be positive" << std::endl;
                 continue;
             }
 
@@ -874,6 +921,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 std::lock_guard<std::mutex> lock(state->mutex);
                 benchmark_id = state->next_benchmark_id++;
                 first_commit_event = state->commit_events.size();
+                state->live_writes.store(0, std::memory_order_release);
+                state->current_benchmark_id.store(benchmark_id,
+                                                  std::memory_order_release);
             }
 
             struct AsyncPutCall {
@@ -906,6 +956,8 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             std::atomic<uint64_t> rpc_failed{0};
             std::atomic<uint64_t> accepted_atomic{0};
             std::atomic<uint64_t> printed_failures{0};
+            std::atomic<uint64_t> skipped_due_to_stall{0};
+            std::atomic<bool> stop_issuing{false};
 
             std::vector<std::atomic<uint64_t>> issued_by_node_atomic(
                 membership->members.size());
@@ -919,10 +971,34 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 size_t start = static_cast<size_t>(shard_id) * chunk;
                 size_t end = std::min(start + chunk, static_cast<size_t>(count));
                 for (size_t i = start; i < end; ++i) {
+                    {
+                        std::unique_lock<std::mutex> lock(state->mutex);
+                        state->cv.wait(lock, [&]() {
+                            return stop_issuing.load(std::memory_order_acquire) ||
+                                   state->current_benchmark_id.load(
+                                       std::memory_order_acquire) != benchmark_id ||
+                                   state->live_writes.load(
+                                       std::memory_order_acquire) < max_outstanding;
+                        });
+                        if (stop_issuing.load(std::memory_order_acquire) ||
+                            state->current_benchmark_id.load(
+                                std::memory_order_acquire) != benchmark_id) {
+                            skipped_due_to_stall.fetch_add(end - i,
+                                                           std::memory_order_relaxed);
+                            break;
+                        }
+                        state->live_writes.fetch_add(1, std::memory_order_acq_rel);
+                    }
+
                     int index = workload[i].target_index;
                     if (index < 0 ||
                         index >= static_cast<int>(membership->stubs.size())) {
                         issue_failed.fetch_add(1);
+                        {
+                            std::lock_guard<std::mutex> lock(state->mutex);
+                            TryReleaseLiveWrite(state, benchmark_id);
+                        }
+                        state->cv.notify_all();
                         if (printed_failures.fetch_add(1) < 10) {
                             std::cout << "bench route error: mode=" << membership->mode
                                       << " epoch=" << membership->epoch
@@ -971,6 +1047,11 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                     auto* call = static_cast<AsyncPutCall*>(tag);
                     if (!ok || !call->status.ok() || !call->response.success()) {
                         rpc_failed.fetch_add(1);
+                        {
+                            std::lock_guard<std::mutex> lock(state->mutex);
+                            TryReleaseLiveWrite(state, benchmark_id);
+                        }
+                        state->cv.notify_all();
                         if (printed_failures.fetch_add(1) < 10) {
                             std::ostringstream out;
                             out << "put failed at " << call->index;
@@ -1024,22 +1105,58 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             // between issue-end and the wait-for-CommitAck loop.
             std::atomic<bool> watcher_done{false};
             std::thread watcher([&]() {
+                constexpr auto kIssueStallTimeout = std::chrono::seconds(15);
+                constexpr auto kWatcherPoll = std::chrono::milliseconds(200);
+                constexpr auto kWatcherPrint = std::chrono::seconds(3);
+                uint64_t last_accounted = 0;
+                uint64_t last_committed = 0;
+                auto last_progress = std::chrono::steady_clock::now();
+                auto last_print = last_progress;
                 while (!watcher_done.load()) {
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    std::this_thread::sleep_for(kWatcherPoll);
                     if (watcher_done.load()) {
                         break;
                     }
                     uint64_t a = accepted_atomic.load();
                     uint64_t fi = issue_failed.load();
                     uint64_t fr = rpc_failed.load();
+                    uint64_t skipped = skipped_due_to_stall.load();
                     uint64_t accounted = a + fi + fr;
-                    uint64_t in_flight = count > accounted ? count - accounted : 0;
-                    std::cout << "bench drain: accepted=" << a
-                              << " rpc_failed=" << fr
-                              << " issue_failed=" << fi
-                              << " in_flight=" << in_flight
-                              << "/" << count
-                              << std::endl;
+                    uint64_t committed_now = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        committed_now = CountBenchmarkCommitsLocked(
+                            state, benchmark_id, first_commit_event);
+                    }
+                    if (accounted > last_accounted || committed_now > last_committed) {
+                        last_accounted = accounted;
+                        last_committed = committed_now;
+                        last_progress = std::chrono::steady_clock::now();
+                    }
+                    auto stalled = std::chrono::steady_clock::now() - last_progress;
+                    uint64_t live = state->live_writes.load(std::memory_order_acquire);
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - last_print >= kWatcherPrint) {
+                        last_print = now;
+                        std::cout << "bench drain: accepted=" << a
+                                  << " committed=" << committed_now
+                                  << " rpc_failed=" << fr
+                                  << " issue_failed=" << fi
+                                  << " live=" << live
+                                  << "/" << max_outstanding
+                                  << " skipped=" << skipped
+                                  << "/" << count
+                                  << std::endl;
+                    }
+                    if (!stop_issuing.load(std::memory_order_acquire) &&
+                        live > 0 && stalled >= kIssueStallTimeout) {
+                        stop_issuing.store(true, std::memory_order_release);
+                        state->cv.notify_all();
+                        std::cout << "bench issuing stopped: no progress for "
+                                  << std::chrono::duration_cast<std::chrono::seconds>(
+                                         kIssueStallTimeout).count()
+                                  << "s" << std::endl;
+                    }
                 }
             });
 
@@ -1060,6 +1177,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
 
             uint64_t failed = issue_failed.load() + rpc_failed.load();
             uint64_t accepted = accepted_atomic.load();
+            uint64_t skipped = skipped_due_to_stall.load();
 
             std::vector<uint64_t> issued_by_node(issued_by_node_atomic.size(), 0);
             for (size_t i = 0; i < issued_by_node_atomic.size(); ++i) {
@@ -1072,7 +1190,7 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
             // while. Without this, a single orphaned write (e.g. the original
             // head was killed mid-flight before forwarding could happen)
             // hangs the entire bench forever.
-            constexpr auto kStallTimeout = std::chrono::seconds(60);
+            constexpr auto kStallTimeout = std::chrono::seconds(15);
             constexpr auto kProgressTick = std::chrono::seconds(5);
             uint64_t orphaned = 0;
             auto last_progress = std::chrono::steady_clock::now();
@@ -1120,6 +1238,9 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                 issue_end - bench_start);
             auto samples = SnapshotBenchmarkSamples(state, benchmark_id,
                                                      first_commit_event, bench_start);
+            state->current_benchmark_id.store(0, std::memory_order_release);
+            state->live_writes.store(0, std::memory_order_release);
+            state->cv.notify_all();
             uint64_t committed = static_cast<uint64_t>(samples.size());
             orphaned = accepted > committed ? accepted - committed : 0;
             double last_commit_sec = 0.0;
@@ -1145,9 +1266,11 @@ void RunRepl(const std::unique_ptr<MetadataService::Stub>& metadata_stub,
                       << " (" << throughput << " ops/sec)"
                       << ", wall " << elapsed.count() << "s"
                       << ", issue " << issue_dur.count() << "s"
+                      << ", max_outstanding " << max_outstanding
                       << ", post-issue " << active_sec << "s"
                       << " (" << active_throughput << " ops/sec)"
                       << ", failed " << failed
+                      << ", skipped " << skipped
                       << ", orphaned " << orphaned
                       << std::endl;
         } else if (command == "pending") {
