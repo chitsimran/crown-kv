@@ -128,21 +128,18 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
         response.set_version(assigned_version);
 
         if (node_index == tail_index || !next_stub) {
-            if (!chain_reads) {
-                kv_store.mark_clean(request.key(), assigned_version);
-                if (prev_stub) {
-                    send_ack(request, prev_stub);
-                }
+            // mark_clean is a no-op in chain_reads mode (nothing in dirty),
+            // but called for consistency so the ack/commit flow is identical
+            // across modes.
+            kv_store.mark_clean(request.key(), assigned_version);
+            if (prev_stub) {
+                send_ack(request, prev_stub);
             }
             send_ack(request, nullptr);
             return response;
         }
 
-        if (chain_reads) {
-            forward_put_untracked(request, next_stub);
-        } else {
-            forward_put(request, next_stub);
-        }
+        forward_put(request, next_stub);
         return response;
     }
 
@@ -157,14 +154,11 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
     }
 
     if (node_index == tail_index || !next_stub) {
-        if (!chain_reads) {
-            CleanState clean_state = get_committed_state(request.key());
-            if (request.version() > clean_state.version) {
-                kv_store.mark_clean(request.key(), request.version());
-            }
-            if (prev_stub) {
-                send_ack(request, prev_stub);
-            }
+        // Same as the head-tail case above: keep the ack/commit flow identical
+        // across modes. mark_clean is a no-op in chain_reads mode.
+        kv_store.mark_clean(request.key(), request.version());
+        if (prev_stub) {
+            send_ack(request, prev_stub);
         }
         send_ack(request, nullptr);
         response.set_success(true);
@@ -172,11 +166,7 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
         return response;
     }
 
-    if (chain_reads) {
-        forward_put_untracked(request, next_stub);
-    } else {
-        forward_put(request, next_stub);
-    }
+    forward_put(request, next_stub);
     response.set_success(true);
     response.set_version(request.version());
     return response;
@@ -289,19 +279,14 @@ GetResponse CrownReplication::handle_get(std::string key) {
 }
 
 void CrownReplication::handle_ack(int64_t request_id) {
-    // chain-reads mode never sends WriteAcks (one-way replication: head → ... →
-    // tail → client). If a WriteAck somehow arrives (e.g., a mid-flight
-    // straggler from a recent mode change), drop it on the floor. No pending
-    // state was kept either, so there's nothing to clean up.
-    if (chain_mode_.load(std::memory_order_acquire)) {
-        return;
-    }
-
     PutRequest request;
     if (!find_pending_request(request_id, &request)) {
         return;
     }
 
+    // mark_clean is a no-op in chain_reads mode (the kv_store dirty map is
+    // unused there). Keeping the call for parity with the other modes — the
+    // pending_acks + WriteAck cascade machinery is identical across modes.
     kv_store.mark_clean(request.key(), request.version());
 
     int ring_size = 0;

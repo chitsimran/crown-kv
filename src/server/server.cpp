@@ -29,6 +29,7 @@ using replication::PutRequest;
 using replication::PutResponse;
 using replication::ReconfigureRequest;
 using replication::ReconfigureResponse;
+using replication::BatchedWriteAck;
 using replication::ReplicationService;
 using replication::ServerStatsRequest;
 using replication::ServerStatsResponse;
@@ -407,6 +408,30 @@ public:
         return grpc::Status::OK;
     }
 
+    grpc::Status SendBatchedWriteAck(grpc::ServerContext*,
+                                     const BatchedWriteAck* request,
+                                     WriteAckResponse* response) override {
+        uint64_t local_epoch = state_->epoch_fast.load(std::memory_order_acquire);
+        int      mode_fast   = state_->mode_fast.load(std::memory_order_acquire);
+        Replication* replication = SelectReplicationFast(mode_fast);
+        if (!replication) {
+            response->set_success(false);
+            return grpc::Status::OK;
+        }
+        uint64_t max_seen_epoch = 0;
+        for (const auto& ack : request->acks()) {
+            if (ack.epoch() > max_seen_epoch) {
+                max_seen_epoch = ack.epoch();
+            }
+            replication->handle_ack(ack.request_id());
+        }
+        if (max_seen_epoch > local_epoch) {
+            RefreshMembershipAsync();
+        }
+        response->set_success(true);
+        return grpc::Status::OK;
+    }
+
     grpc::Status VersionQuery(grpc::ServerContext*, const VersionQueryRequest* request,
                               VersionQueryResponse* response) override {
         uint64_t local_epoch = state_->epoch_fast.load(std::memory_order_acquire);
@@ -656,6 +681,10 @@ int main(int argc, char** argv) {
 
     bool verbose = false;
     bool crown_chain_reads = false;
+    // Server-to-server WriteAck batching is enabled by default. Set to 0 to
+    // disable and revert to per-write WriteAck RPCs.
+    int64_t ack_batch_interval_ms = 20;
+    size_t ack_batch_max_size = 256;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--node-id" && i + 1 < argc) {
@@ -668,6 +697,10 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (arg == "--crown-chain-reads") {
             crown_chain_reads = true;
+        } else if (arg == "--ack-batch-interval-ms" && i + 1 < argc) {
+            ack_batch_interval_ms = std::stoll(argv[++i]);
+        } else if (arg == "--ack-batch-max-size" && i + 1 < argc) {
+            ack_batch_max_size = static_cast<size_t>(std::stoull(argv[++i]));
         }
     }
 
@@ -678,6 +711,14 @@ int main(int argc, char** argv) {
 
     g_verbose_server_logging.store(verbose, std::memory_order_relaxed);
     replication_common::set_verbose_logging(verbose);
+    replication_common::configure_write_ack_batching(ack_batch_interval_ms,
+                                                     ack_batch_max_size);
+    std::cout << "WriteAck batching: "
+              << (ack_batch_interval_ms > 0
+                      ? "interval=" + std::to_string(ack_batch_interval_ms) +
+                        "ms max_batch=" + std::to_string(ack_batch_max_size)
+                      : "disabled")
+              << std::endl;
 
     ServerState state;
     state.node_id = node_id;

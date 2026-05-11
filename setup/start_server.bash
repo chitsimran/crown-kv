@@ -18,6 +18,9 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 # Set CROWN_CHAIN_READS=1 in setup/.env to start servers with --crown-chain-reads
 # (CROWN uses chain-style reads/versioning, no dirty store).
 CROWN_CHAIN_READS="${CROWN_CHAIN_READS:-0}"
+# WriteAck batching across the chain. Default 20 ms; set to 0 to disable.
+ACK_BATCH_INTERVAL_MS="${ACK_BATCH_INTERVAL_MS:-20}"
+ACK_BATCH_MAX_SIZE="${ACK_BATCH_MAX_SIZE:-256}"
 SESSION_NAME="crown_node_${NODE_PORT}"
 
 echo "=== CROWN-KV server deploy starting (user: $DEPLOY_USER, node: $NODE_ID) ==="
@@ -157,7 +160,8 @@ start_server() {
     if [[ "$CROWN_CHAIN_READS" == "1" ]]; then
         chain_reads_flag=" --crown-chain-reads"
     fi
-    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR}${chain_reads_flag}' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}'${chain_reads_flag} --verbose 2>&1"
+    local batch_flag=" --ack-batch-interval-ms ${ACK_BATCH_INTERVAL_MS} --ack-batch-max-size ${ACK_BATCH_MAX_SIZE}"
+    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR}${chain_reads_flag}${batch_flag}' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}'${chain_reads_flag}${batch_flag} --verbose 2>&1"
     echo "Run command: $server_cmd"
     {
         echo "[launch] $(date -Is)"

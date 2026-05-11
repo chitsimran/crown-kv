@@ -77,4 +77,11 @@ inline bool parse_host_port(const std::string& input, std::string* host, int* po
 void set_verbose_logging(bool enabled);
 bool verbose_logging_enabled();
 
+// Configure server-to-server WriteAck batching. interval_ms <= 0 disables.
+// When enabled, WriteAcks from send_ack() are buffered by destination stub and
+// flushed every interval_ms (or when max_batch_size accumulates) as a single
+// BatchedWriteAck RPC. Reduces inter-node RPC count under load while preserving
+// retry semantics (the receiver still iterates and processes each ack).
+void configure_write_ack_batching(int64_t interval_ms, size_t max_batch_size);
+
 } // namespace replication_common

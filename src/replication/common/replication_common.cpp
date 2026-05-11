@@ -3,12 +3,17 @@
 
 #include <grpcpp/grpcpp.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 using replication::ClientAckService;
 using replication::CommitAck;
@@ -37,6 +42,11 @@ constexpr int kMaxRetryCount = 3;
 // ForwardPut is issued immediately without blocking a gRPC server thread.
 // Sharding avoids a single CQ becoming the bottleneck under high forwarding load.
 constexpr size_t kForwardCQCount = 4;
+// Worker count for the sync inter-node RPC dispatcher (matches the old
+// crown-kv prototype's PropagateDispatcher pattern: a thread pool that issues
+// blocking gRPC calls, decoupling the handler from network completion). Higher
+// than the old prototype's 8 because our saturated rates are higher.
+constexpr size_t kSyncDispatcherWorkers = 32;
 
 std::atomic<bool> g_log_verbose{false};
 
@@ -89,6 +99,74 @@ struct CommitAckCall : AsyncAckCallBase {
     std::unique_ptr<grpc::ClientAsyncResponseReader<CommitAckResponse>> rpc;
 };
 
+// =============================================================================
+// SyncDispatcher — a thread pool that issues blocking gRPC calls. Modeled on
+// the old crown-kv prototype's PropagateDispatcher: handlers enqueue a task,
+// the dispatcher's worker pool runs it on a separate thread. The handler
+// thread is unblocked the moment the task is queued; the worker absorbs the
+// network round-trip. Used for every inter-node RPC the server initiates
+// (ForwardPut, SendWriteAck, SendBatchedWriteAck) and also for outbound
+// CommitAcks to the client. Reverts the prior CompletionQueue-based async
+// path back to a simpler sync-call model.
+// =============================================================================
+
+class SyncDispatcher {
+public:
+    static SyncDispatcher& instance() {
+        static SyncDispatcher d;
+        return d;
+    }
+
+    using Task = std::function<void()>;
+
+    void enqueue(Task task) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            queue_.push(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    SyncDispatcher() {
+        workers_.reserve(kSyncDispatcherWorkers);
+        for (size_t i = 0; i < kSyncDispatcherWorkers; ++i) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~SyncDispatcher() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable()) w.join();
+        }
+    }
+
+    void worker_loop() {
+        while (true) {
+            Task task;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) return;
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+            task();
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::queue<Task> queue_;
+    std::vector<std::thread> workers_;
+    bool stop_ = false;
+};
+
 class AsyncAckPump {
 public:
     static AsyncAckPump& instance() {
@@ -121,14 +199,27 @@ private:
     std::thread worker_;
 };
 
-void issue_async_write_ack(const std::shared_ptr<replication::ReplicationService::Stub>& stub,
-                           const WriteAck& ack) {
-    auto* call = new WriteAckCall();
-    call->context.set_deadline(std::chrono::system_clock::now() + kAckRpcDeadline);
-    call->rpc = stub->PrepareAsyncSendWriteAck(&call->context, ack,
-                                               AsyncAckPump::instance().queue());
-    call->rpc->StartCall();
-    call->rpc->Finish(&call->response, &call->status, call);
+void issue_sync_write_ack(std::shared_ptr<replication::ReplicationService::Stub> stub,
+                          WriteAck ack) {
+    SyncDispatcher::instance().enqueue(
+        [stub = std::move(stub), ack = std::move(ack)]() {
+            WriteAckResponse resp;
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + kAckRpcDeadline);
+            stub->SendWriteAck(&ctx, ack, &resp);
+        });
+}
+
+void issue_sync_batched_write_ack(
+    std::shared_ptr<replication::ReplicationService::Stub> stub,
+    replication::BatchedWriteAck batch) {
+    SyncDispatcher::instance().enqueue(
+        [stub = std::move(stub), batch = std::move(batch)]() {
+            WriteAckResponse resp;
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + kAckRpcDeadline);
+            stub->SendBatchedWriteAck(&ctx, batch, &resp);
+        });
 }
 
 void issue_async_commit_ack(const std::shared_ptr<ClientAckService::Stub>& stub,
@@ -140,6 +231,116 @@ void issue_async_commit_ack(const std::shared_ptr<ClientAckService::Stub>& stub,
     call->rpc->StartCall();
     call->rpc->Finish(&call->response, &call->status, call);
 }
+
+// =============================================================================
+// WriteAckBatcher — server-to-server WriteAck batching.
+// Disabled by default (interval=0). When enabled, enqueue() pushes the ack
+// into a per-destination buffer; a background flusher periodically (or on
+// max-size) sends a single BatchedWriteAck per destination. Reduces the
+// per-write inter-node RPC count while keeping retry semantics (each receiver
+// processes the batch by calling handle_ack per entry, same as the per-RPC
+// path).
+// =============================================================================
+
+class WriteAckBatcher {
+public:
+    static WriteAckBatcher& instance() {
+        static WriteAckBatcher b;
+        return b;
+    }
+
+    // interval_ms <= 0 disables batching. Returns immediately; the worker
+    // thread continues running with the new parameters at the next iteration.
+    void configure(int64_t interval_ms, size_t max_batch_size) {
+        std::lock_guard<std::mutex> lock(mu_);
+        interval_ms_ = interval_ms;
+        max_batch_size_ = max_batch_size > 0 ? max_batch_size : 1;
+        cv_.notify_all();
+    }
+
+    bool enabled() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return interval_ms_ > 0;
+    }
+
+    void enqueue(const std::shared_ptr<replication::ReplicationService::Stub>& dest,
+                 const WriteAck& ack) {
+        if (!dest) return;
+        std::lock_guard<std::mutex> lock(mu_);
+        auto& bucket = buckets_[dest.get()];
+        bucket.dest = dest;
+        bucket.acks.push_back(ack);
+        if (bucket.acks.size() >= max_batch_size_) {
+            cv_.notify_all();
+        }
+    }
+
+private:
+    WriteAckBatcher() : worker_([this]() { run(); }) {}
+    ~WriteAckBatcher() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    struct Bucket {
+        std::shared_ptr<replication::ReplicationService::Stub> dest;
+        std::vector<WriteAck> acks;
+    };
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mu_);
+        while (!stop_) {
+            // If disabled, park on the CV until configure() wakes us.
+            if (interval_ms_ <= 0) {
+                cv_.wait(lock, [this]() { return stop_ || interval_ms_ > 0; });
+                continue;
+            }
+            // Wait for the flush interval OR an immediate wake-up (size-trigger
+            // or shutdown). Either way, on wake we flush whatever is buffered.
+            cv_.wait_for(lock, std::chrono::milliseconds(interval_ms_),
+                         [this]() { return stop_; });
+            flush_locked(lock);
+        }
+        // Final flush on shutdown.
+        flush_locked(lock);
+    }
+
+    // Drains all buckets while releasing the lock during each network issue,
+    // so producers can keep enqueueing while we issue.
+    void flush_locked(std::unique_lock<std::mutex>& lock) {
+        if (buckets_.empty()) return;
+        std::vector<Bucket> snapshot;
+        snapshot.reserve(buckets_.size());
+        for (auto& kv : buckets_) {
+            if (kv.second.acks.empty()) continue;
+            snapshot.push_back(std::move(kv.second));
+            kv.second.acks.clear();
+        }
+        if (snapshot.empty()) return;
+        lock.unlock();
+        for (auto& bucket : snapshot) {
+            replication::BatchedWriteAck batch;
+            batch.mutable_acks()->Reserve(static_cast<int>(bucket.acks.size()));
+            for (auto& ack : bucket.acks) {
+                *batch.add_acks() = std::move(ack);
+            }
+            issue_sync_batched_write_ack(bucket.dest, std::move(batch));
+        }
+        lock.lock();
+    }
+
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::unordered_map<replication::ReplicationService::Stub*, Bucket> buckets_;
+    int64_t interval_ms_ = 0;
+    size_t max_batch_size_ = 256;
+    bool stop_ = false;
+    std::thread worker_;
+};
 
 } // namespace
 
@@ -219,6 +420,10 @@ void set_verbose_logging(bool enabled) {
 
 bool verbose_logging_enabled() {
     return g_log_verbose.load(std::memory_order_relaxed);
+}
+
+void configure_write_ack_batching(int64_t interval_ms, size_t max_batch_size) {
+    WriteAckBatcher::instance().configure(interval_ms, max_batch_size);
 }
 
 } // namespace replication_common
@@ -403,6 +608,30 @@ std::vector<PutRequest> Replication::collect_expired_requests() {
     return expired;
 }
 
+namespace {
+
+void enqueue_sync_forward_put(std::shared_ptr<ReplicationService::Stub> stub,
+                              PutRequest request) {
+    SyncDispatcher::instance().enqueue(
+        [stub = std::move(stub), request = std::move(request)]() {
+            PutResponse resp;
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + kForwardRpcDeadline);
+            grpc::Status status = stub->ForwardPut(&ctx, request, &resp);
+            if (!status.ok()) {
+                std::ostringstream out;
+                out << "sync_forward_put_fail"
+                    << " code=" << static_cast<int>(status.error_code())
+                    << " msg=\"" << status.error_message() << "\""
+                    << " request_id=" << request.request_id()
+                    << " key=" << request.key();
+                LogReplicationEvent(out.str());
+            }
+        });
+}
+
+} // namespace
+
 void Replication::forward_put(PutRequest request,
                               const std::shared_ptr<ReplicationService::Stub>& next_stub) {
     if (!next_stub) {
@@ -410,7 +639,7 @@ void Replication::forward_put(PutRequest request,
     }
     request.set_epoch(epoch_.load());
     add_to_pending_acks(request);
-    AsyncForwardPump::instance().issue(next_stub, request);
+    enqueue_sync_forward_put(next_stub, std::move(request));
 }
 
 void Replication::forward_put_untracked(PutRequest request,
@@ -419,7 +648,7 @@ void Replication::forward_put_untracked(PutRequest request,
         return;
     }
     request.set_epoch(epoch_.load());
-    AsyncForwardPump::instance().issue(next_stub, request);
+    enqueue_sync_forward_put(next_stub, std::move(request));
 }
 
 void Replication::send_ack(const PutRequest& request,
@@ -430,7 +659,11 @@ void Replication::send_ack(const PutRequest& request,
         ack.set_key(request.key());
         ack.set_version(request.version());
         ack.set_epoch(request.epoch());
-        issue_async_write_ack(prev_stub, ack);
+        if (WriteAckBatcher::instance().enabled()) {
+            WriteAckBatcher::instance().enqueue(prev_stub, ack);
+        } else {
+            issue_sync_write_ack(prev_stub, std::move(ack));
+        }
         return;
     }
 
@@ -445,5 +678,11 @@ void Replication::send_ack(const PutRequest& request,
     CommitAck ack;
     ack.set_key(request.key());
     ack.set_version(request.version());
-    issue_async_commit_ack(stub, ack);
+    SyncDispatcher::instance().enqueue(
+        [stub, ack = std::move(ack)]() {
+            CommitAckResponse resp;
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + kAckRpcDeadline);
+            stub->CommitAck(&ctx, ack, &resp);
+        });
 }

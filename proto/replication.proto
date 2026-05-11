@@ -151,6 +151,10 @@ message SetModeResponse {
     uint64 epoch = 3;
 }
 
+message BatchedWriteAck {
+    repeated WriteAck acks = 1;
+}
+
 message ServerStatsRequest {}
 
 message ServerStatsResponse {
@@ -170,6 +174,10 @@ service ReplicationService {
 
     rpc ForwardPut (PutRequest) returns (PutResponse);
     rpc SendWriteAck (WriteAck) returns (WriteAckResponse);
+    // Batched form of SendWriteAck. The receiver processes each ack as if it
+    // arrived individually. Reduces inter-node RPC count when --ack-batch-interval-ms
+    // is set on the senders.
+    rpc SendBatchedWriteAck (BatchedWriteAck) returns (WriteAckResponse);
     rpc VersionQuery (VersionQueryRequest) returns (VersionQueryResponse);
     rpc ForwardInflight (InflightRequest) returns (InflightResponse);
     rpc StateDump (StateDumpRequest) returns (StateDumpResponse);
