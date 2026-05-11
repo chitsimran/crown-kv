@@ -107,6 +107,7 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
 
     int head_index = replication_common::head_index(request.key(), ring_size);
     int tail_index = replication_common::tail_index(request.key(), ring_size);
+    const bool chain_reads = chain_mode_.load(std::memory_order_acquire);
 
     if (request.version() == 0) {
         if (node_index != head_index) {
@@ -119,13 +120,17 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
             return response;
         }
 
-        uint64_t assigned_version = kv_store.put(request.key(), request.value(), std::nullopt);
+        uint64_t assigned_version = chain_reads
+            ? kv_store.put_committed(request.key(), request.value(), std::nullopt)
+            : kv_store.put(request.key(), request.value(), std::nullopt);
         request.set_version(assigned_version);
         response.set_success(true);
         response.set_version(assigned_version);
 
         if (node_index == tail_index || !next_stub) {
-            kv_store.mark_clean(request.key(), assigned_version);
+            if (!chain_reads) {
+                kv_store.mark_clean(request.key(), assigned_version);
+            }
             if (prev_stub) {
                 send_ack(request, prev_stub);
             }
@@ -137,15 +142,22 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
         return response;
     }
 
-    CleanState clean_state = get_committed_state(request.key());
-    bool stale = request.version() <= clean_state.version;
-    if (!stale) {
-        kv_store.put(request.key(), request.value(), request.version());
+    if (chain_reads) {
+        kv_store.put_committed(request.key(), request.value(), request.version());
+    } else {
+        CleanState clean_state = get_committed_state(request.key());
+        bool stale = request.version() <= clean_state.version;
+        if (!stale) {
+            kv_store.put(request.key(), request.value(), request.version());
+        }
     }
 
     if (node_index == tail_index || !next_stub) {
-        if (!stale) {
-            kv_store.mark_clean(request.key(), request.version());
+        if (!chain_reads) {
+            CleanState clean_state = get_committed_state(request.key());
+            if (request.version() > clean_state.version) {
+                kv_store.mark_clean(request.key(), request.version());
+            }
         }
         if (prev_stub) {
             send_ack(request, prev_stub);
@@ -176,6 +188,32 @@ GetResponse CrownReplication::handle_get(std::string key) {
 
     if (ring_size == 0) {
         response.set_error("NO_MEMBERSHIP");
+        return response;
+    }
+
+    if (chain_mode_.load(std::memory_order_acquire)) {
+        // Chain-style reads: only the per-key tail serves reads, and the value
+        // returned is the committed one (which is the only one since dirty is
+        // unused in this mode). No version-query RPC needed.
+        int tail_index_for_key = replication_common::tail_index(key, ring_size);
+        if (node_index != tail_index_for_key) {
+            std::string error = "WRONG_NODE";
+            if (tail_index_for_key >= 0 &&
+                tail_index_for_key < static_cast<int>(membership.size())) {
+                error += ":" +
+                         replication_common::address_from_node(membership[tail_index_for_key]);
+            }
+            response.set_error(error);
+            return response;
+        }
+        auto value = kv_store.get(key);
+        if (!value.has_value()) {
+            response.set_error("NOT_FOUND");
+            return response;
+        }
+        CleanState clean_state = get_committed_state(key);
+        response.set_value(value.value());
+        response.set_version(clean_state.version);
         return response;
     }
 
@@ -248,7 +286,9 @@ void CrownReplication::handle_ack(int64_t request_id) {
         return;
     }
 
-    kv_store.mark_clean(request.key(), request.version());
+    if (!chain_mode_.load(std::memory_order_acquire)) {
+        kv_store.mark_clean(request.key(), request.version());
+    }
 
     int ring_size = 0;
     int node_index = 0;

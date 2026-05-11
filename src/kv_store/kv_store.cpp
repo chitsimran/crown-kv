@@ -42,6 +42,29 @@ uint64_t KVStore::put(const std::string& key, const std::string& value,
     return provided_version;
 }
 
+uint64_t KVStore::put_committed(const std::string& key, const std::string& value,
+                                std::optional<uint64_t> version) {
+    auto& stripe = stripe_for(key);
+    std::lock_guard<std::mutex> lock(stripe.mu);
+    if (!version.has_value()) {
+        uint64_t latest = 0;
+        auto it = stripe.committed.find(key);
+        if (it != stripe.committed.end()) {
+            latest = it->second.verison;
+        }
+        uint64_t new_version = latest + 1;
+        stripe.committed[key] = Record{new_version, value};
+        return new_version;
+    }
+    uint64_t provided = version.value();
+    auto it = stripe.committed.find(key);
+    if (it != stripe.committed.end() && provided <= it->second.verison) {
+        return it->second.verison;
+    }
+    stripe.committed[key] = Record{provided, value};
+    return provided;
+}
+
 std::optional<std::string> KVStore::get(const std::string& key) {
     auto& stripe = stripe_for(key);
     std::lock_guard<std::mutex> lock(stripe.mu);

@@ -47,6 +47,15 @@ public:
     // if version == null, it means the request is from client to head, so we can just assign it a new version that is higher than the current version in store
     static uint64_t put(const std::string& key, const std::string& value, std::optional<uint64_t> version);
 
+    // Write directly to the committed store, bypassing the dirty/committed
+    // distinction. Used by CROWN in chain-read mode (--crown-chain-reads):
+    // there's no read-time validation against the tail, so values can be
+    // visible immediately at every replica. This is single-lock, single-map
+    // and avoids the dirty-map scan path entirely. version=nullopt → head
+    // path (assign latest_committed+1). version=value → forwarded-put path.
+    static uint64_t put_committed(const std::string& key, const std::string& value,
+                                  std::optional<uint64_t> version);
+
     static std::optional<std::string> get(const std::string& key);
 
     // get the highest version (max in both committed and dirty) for a key

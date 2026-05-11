@@ -37,6 +37,7 @@ CLIENT_ACK_PORT="${CLIENT_ACK_PORT:-6000}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 RUN_SCOPE="${RUN_SCOPE:-shared}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+CROWN_CHAIN_READS="${CROWN_CHAIN_READS:-0}"
 
 METADATA_ADDR="${METADATA_HOST}:${METADATA_PORT}"
 
@@ -122,7 +123,8 @@ remote_env_args() {
         "MEMBERS_ARG=$MEMBERS_ARG" \
         "TMUX_SOCKET=$TMUX_SOCKET" \
         "RUN_SCOPE=$RUN_SCOPE" \
-        "SKIP_BUILD=$SKIP_BUILD"
+        "SKIP_BUILD=$SKIP_BUILD" \
+        "CROWN_CHAIN_READS=$CROWN_CHAIN_READS"
 }
 
 copy_and_run() {

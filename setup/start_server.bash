@@ -15,6 +15,9 @@ METADATA_ADDR="${METADATA_ADDR:?METADATA_ADDR is required}"
 RUN_SCOPE="${RUN_SCOPE:-shared}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+# Set CROWN_CHAIN_READS=1 in setup/.env to start servers with --crown-chain-reads
+# (CROWN uses chain-style reads/versioning, no dirty store).
+CROWN_CHAIN_READS="${CROWN_CHAIN_READS:-0}"
 SESSION_NAME="crown_node_${NODE_PORT}"
 
 echo "=== CROWN-KV server deploy starting (user: $DEPLOY_USER, node: $NODE_ID) ==="
@@ -150,7 +153,11 @@ start_server() {
     : > "$out_file"
 
     local server_cmd
-    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR}' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}' --verbose 2>&1"
+    local chain_reads_flag=""
+    if [[ "$CROWN_CHAIN_READS" == "1" ]]; then
+        chain_reads_flag=" --crown-chain-reads"
+    fi
+    server_cmd="cd '$PROJECT_DIR' && echo '[started] '\"\$(date -Is)\" && echo '[host] '\"\$(hostname -f 2>/dev/null || hostname)\" && echo '[cmd] build/server --node-id ${NODE_ID} --listen ${NODE_BIND_HOST}:${NODE_PORT} --metadata ${METADATA_ADDR}${chain_reads_flag}' && exec build/server --node-id '${NODE_ID}' --listen '${NODE_BIND_HOST}:${NODE_PORT}' --metadata '${METADATA_ADDR}'${chain_reads_flag} --verbose 2>&1"
     echo "Run command: $server_cmd"
     {
         echo "[launch] $(date -Is)"

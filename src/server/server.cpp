@@ -655,6 +655,7 @@ int main(int argc, char** argv) {
     std::string metadata_addr = "127.0.0.1:50050";
 
     bool verbose = false;
+    bool crown_chain_reads = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--node-id" && i + 1 < argc) {
@@ -665,6 +666,8 @@ int main(int argc, char** argv) {
             metadata_addr = argv[++i];
         } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
+        } else if (arg == "--crown-chain-reads") {
+            crown_chain_reads = true;
         }
     }
 
@@ -682,6 +685,10 @@ int main(int argc, char** argv) {
     ChainReplication chain_replication;
     CraqReplication craq_replication;
     CrownReplication crown_replication;
+    crown_replication.set_chain_mode(crown_chain_reads);
+    std::cout << "CROWN read mode: "
+              << (crown_chain_reads ? "chain (no dirty store)" : "craq (with dirty store)")
+              << std::endl;
 
     MetadataClient metadata_client(metadata_addr);
     RefreshMembership(&state, &metadata_client, &chain_replication, &craq_replication,
