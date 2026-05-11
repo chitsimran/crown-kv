@@ -257,7 +257,14 @@ int SelectReadNodeIndex(const MembershipState& membership, const std::string& ke
     if (membership.mode == "CHAIN") {
         return ring_size - 1;
     }
-    return replication_common::head_index(key, ring_size);
+    if (membership.mode == "CRAQ") {
+        // CRAQ: any replica can serve reads; use round-robin for load distribution
+        static std::atomic<size_t> craq_rr_counter{0};
+        return (craq_rr_counter.fetch_add(1, std::memory_order_relaxed)) % ring_size;
+    }
+    // CROWN: any replica can serve reads; use round-robin for load distribution
+    static std::atomic<size_t> crown_rr_counter{0};
+    return (crown_rr_counter.fetch_add(1, std::memory_order_relaxed)) % ring_size;
 }
 
 bool SendPutWithRetry(const std::string& key, const std::string& value,

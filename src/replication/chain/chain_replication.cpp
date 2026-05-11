@@ -87,6 +87,13 @@ PutResponse ChainReplication::handle_put(PutRequest request) {
         response.set_success(true);
         response.set_version(assigned_version);
 
+        if (ring_size == 1) {
+            // Single node is both head and tail; only send to client, not backwards to self
+            kv_store.mark_clean(request.key(), assigned_version);
+            send_ack(request, nullptr);
+            return response;
+        }
+
         if (ring_size == 1 || !next_stub) {
             kv_store.mark_clean(request.key(), assigned_version);
             // Single-node ring: head == tail. prev_stub is null so this becomes a
@@ -105,6 +112,17 @@ PutResponse ChainReplication::handle_put(PutRequest request) {
     bool stale = request.version() <= latest_version;
     if (!stale) {
         kv_store.put(request.key(), request.value(), request.version());
+    }
+
+    if (ring_size == 1) {
+        // Single node is both head and tail; only send to client, not backwards to self
+        if (!stale) {
+            kv_store.mark_clean(request.key(), request.version());
+        }
+        send_ack(request, nullptr);
+        response.set_success(true);
+        response.set_version(request.version());
+        return response;
     }
 
     if (node_index == tail_index) {

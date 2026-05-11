@@ -19,13 +19,15 @@ using replication::WriteAckResponse;
 
 namespace {
 
-// Pending-ack retry deadline. Short enough that a stuck forward retries quickly,
-// long enough that a healthy chain isn't spammed unnecessarily.
-constexpr auto kAckTimeout = std::chrono::milliseconds(10000); // 10 seconds
+// Pending-ack retry deadline. Reduced from 10s to 5s so stuck writes are detected
+// and retried faster, allowing recovery from transient successor failures.
+// At 5K writes/sec, 5s timeout means up to 25K pending entries; 10s means 50K.
+constexpr auto kAckTimeout = std::chrono::milliseconds(5000); // 5 seconds
 // gRPC deadline for individual ForwardPut RPCs. Tight enough that a forward to a
 // dead node fails fast (instead of holding a worker for a full minute), but wide
 // enough to absorb benchmark-induced slowness on a healthy successor.
-constexpr auto kForwardRpcDeadline = std::chrono::milliseconds(10000); // 10 seconds
+// Reduced from 10s to 5s to detect stuck writes faster and trigger retry/reconfigure.
+constexpr auto kForwardRpcDeadline = std::chrono::milliseconds(5000); // 5 seconds
 // gRPC deadline for fire-and-forget ack RPCs (WriteAck/CommitAck). Long enough to
 // survive transient stalls but short enough that slow consumers don't bloat the CQ.
 constexpr auto kAckRpcDeadline = std::chrono::milliseconds(10000);
@@ -36,7 +38,8 @@ constexpr int kMaxRetryCount = 3;
 // Sharded async completion queues for ForwardPut RPCs. Fire-and-forget: each
 // ForwardPut is issued immediately without blocking a gRPC server thread.
 // Sharding avoids a single CQ becoming the bottleneck under high forwarding load.
-constexpr size_t kForwardCQCount = 4;
+// Increased from 4 to 32 to handle >5K writes/sec without CQ saturation.
+constexpr size_t kForwardCQCount = 32;
 
 std::atomic<bool> g_log_verbose{false};
 
