@@ -67,6 +67,15 @@ public:
     // asynchronously forward the put request to the next node, and add it to pending_acks until you receive an ack for it
     void forward_put(PutRequest request, const std::shared_ptr<ReplicationService::Stub>& next_stub);
 
+    // Asynchronously forward without inserting into pending_acks. Used by
+    // CROWN-chain-reads mode where there is no backward WriteAck cascade and
+    // therefore no entry would ever be cleared. Caller accepts that a failed
+    // forward leaves the write only partially replicated with no retry path —
+    // the recovery story is the same as the old (fast) CROWN implementation:
+    // none. Suitable for benchmarks; not for production.
+    void forward_put_untracked(PutRequest request,
+                               const std::shared_ptr<ReplicationService::Stub>& next_stub);
+
     // If prev_stub is null, fire a CommitAck to the client (request.client_addr()).
     // Otherwise, fire a WriteAck to the predecessor node. Both calls are async.
     void send_ack(const PutRequest& request,

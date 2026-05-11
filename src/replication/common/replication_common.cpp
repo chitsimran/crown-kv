@@ -413,6 +413,15 @@ void Replication::forward_put(PutRequest request,
     AsyncForwardPump::instance().issue(next_stub, request);
 }
 
+void Replication::forward_put_untracked(PutRequest request,
+                                        const std::shared_ptr<ReplicationService::Stub>& next_stub) {
+    if (!next_stub) {
+        return;
+    }
+    request.set_epoch(epoch_.load());
+    AsyncForwardPump::instance().issue(next_stub, request);
+}
+
 void Replication::send_ack(const PutRequest& request,
                            const std::shared_ptr<ReplicationService::Stub>& prev_stub) {
     if (prev_stub) {

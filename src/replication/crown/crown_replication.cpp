@@ -130,15 +130,19 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
         if (node_index == tail_index || !next_stub) {
             if (!chain_reads) {
                 kv_store.mark_clean(request.key(), assigned_version);
-            }
-            if (prev_stub) {
-                send_ack(request, prev_stub);
+                if (prev_stub) {
+                    send_ack(request, prev_stub);
+                }
             }
             send_ack(request, nullptr);
             return response;
         }
 
-        forward_put(request, next_stub);
+        if (chain_reads) {
+            forward_put_untracked(request, next_stub);
+        } else {
+            forward_put(request, next_stub);
+        }
         return response;
     }
 
@@ -158,9 +162,9 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
             if (request.version() > clean_state.version) {
                 kv_store.mark_clean(request.key(), request.version());
             }
-        }
-        if (prev_stub) {
-            send_ack(request, prev_stub);
+            if (prev_stub) {
+                send_ack(request, prev_stub);
+            }
         }
         send_ack(request, nullptr);
         response.set_success(true);
@@ -168,7 +172,11 @@ PutResponse CrownReplication::handle_put(PutRequest request) {
         return response;
     }
 
-    forward_put(request, next_stub);
+    if (chain_reads) {
+        forward_put_untracked(request, next_stub);
+    } else {
+        forward_put(request, next_stub);
+    }
     response.set_success(true);
     response.set_version(request.version());
     return response;
@@ -281,14 +289,20 @@ GetResponse CrownReplication::handle_get(std::string key) {
 }
 
 void CrownReplication::handle_ack(int64_t request_id) {
+    // chain-reads mode never sends WriteAcks (one-way replication: head → ... →
+    // tail → client). If a WriteAck somehow arrives (e.g., a mid-flight
+    // straggler from a recent mode change), drop it on the floor. No pending
+    // state was kept either, so there's nothing to clean up.
+    if (chain_mode_.load(std::memory_order_acquire)) {
+        return;
+    }
+
     PutRequest request;
     if (!find_pending_request(request_id, &request)) {
         return;
     }
 
-    if (!chain_mode_.load(std::memory_order_acquire)) {
-        kv_store.mark_clean(request.key(), request.version());
-    }
+    kv_store.mark_clean(request.key(), request.version());
 
     int ring_size = 0;
     int node_index = 0;
